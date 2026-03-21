@@ -6,7 +6,7 @@
 from machine import Pin, I2C
 import time
 
-# -------- PCA9685 driver --------
+#  PCA9685 driver --------
 class PCA9685:
     def __init__(self, i2c, address=0x40):
         self.i2c = i2c
@@ -41,7 +41,7 @@ class PCA9685:
         ])
         self.i2c.writeto_mem(self.address, reg, data)
 
-# -------- Servo helper --------
+#  Servo helper 
 class Servo:
     def __init__(self, pca, channel, min_us=500, max_us=2500, freq=50):
         self.pca = pca
@@ -57,7 +57,7 @@ class Servo:
         counts = int((pulse_us / period_us) * 4096)
         self.pca.set_pwm(self.channel, 0, counts)
 
-# -------- Main --------
+#  Main 
 i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=400000)
 
 print("Scanning I2C...")
