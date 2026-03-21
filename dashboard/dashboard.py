@@ -880,30 +880,17 @@ class DashboardWindow(QMainWindow):
         right = QVBoxLayout()
         right.setSpacing(8)
 
-        # Altitude bar
-        self.alt_bar = BarGraph("ALT", "m", ACCENT, 0, 200)
-        alt_card = make_card("Altitude", self.alt_bar)
-        self.alt_val_lbl = QLabel("0.0 m")
-        self.alt_val_lbl.setFont(QFont(MONO, 11, QFont.Weight.Bold))
-        self.alt_val_lbl.setStyleSheet(f"color: {ACCENT};")
-        self.alt_val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        alt_card.layout().addWidget(self.alt_val_lbl)
-        right.addWidget(alt_card, 1)
-
-        # Signal bar
-        self.sig_bar = BarGraph("RSSI", "dBm", ACCENT2, -120, 0)
-        sig_card = make_card("Signal", self.sig_bar)
-        self.sig_val_lbl = QLabel("– dBm")
-        self.sig_val_lbl.setFont(QFont(MONO, 11, QFont.Weight.Bold))
-        self.sig_val_lbl.setStyleSheet(f"color: {ACCENT2};")
-        self.sig_val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sig_card.layout().addWidget(self.sig_val_lbl)
-        right.addWidget(sig_card, 1)
+        # Altitude/Signal removed from UI
+        self.alt_bar = None
+        self.alt_val_lbl = None
+        self.sig_bar = None
+        self.sig_val_lbl = None
 
         # Accelerometer
         self.accel = AccelReadout()
         acc_card = make_card("Accelerometer", self.accel)
-        right.addWidget(acc_card, 2)
+        right.addWidget(acc_card, 1)
+        right.addStretch(1)
 
         right_w = QWidget()
         right_w.setLayout(right)
@@ -1225,13 +1212,17 @@ class DashboardWindow(QMainWindow):
 
         if "ALT" in data:
             v = data["ALT"]
-            self.alt_bar.set_value(v)
-            self.alt_val_lbl.setText(f"{v:.1f} m")
+            if self.alt_bar:
+                self.alt_bar.set_value(v)
+            if self.alt_val_lbl:
+                self.alt_val_lbl.setText(f"{v:.1f} m")
 
         if "RSSI" in data:
             v = data["RSSI"]
-            self.sig_bar.set_value(v)
-            self.sig_val_lbl.setText(f"{v:.0f} dBm")
+            if self.sig_bar:
+                self.sig_bar.set_value(v)
+            if self.sig_val_lbl:
+                self.sig_val_lbl.setText(f"{v:.0f} dBm")
 
         if "AX" in data or "AY" in data or "AZ" in data:
             self.accel.set_accel(
@@ -1272,10 +1263,14 @@ class DashboardWindow(QMainWindow):
         self.compass.set_heading(heading)
         if self.hdg_lbl:
             self.hdg_lbl.setText(f"{int(heading):03d}°")
-        self.alt_bar.set_value(alt)
-        self.alt_val_lbl.setText(f"{alt:.1f} m")
-        self.sig_bar.set_value(rssi)
-        self.sig_val_lbl.setText(f"{rssi:.0f} dBm")
+        if self.alt_bar:
+            self.alt_bar.set_value(alt)
+        if self.alt_val_lbl:
+            self.alt_val_lbl.setText(f"{alt:.1f} m")
+        if self.sig_bar:
+            self.sig_bar.set_value(rssi)
+        if self.sig_val_lbl:
+            self.sig_val_lbl.setText(f"{rssi:.0f} dBm")
         self.accel.set_accel(ax, ay, az)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
