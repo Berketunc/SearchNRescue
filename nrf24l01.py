@@ -50,7 +50,16 @@ NOP = const(0xFF)  # use to read STATUS register
 
 
 class NRF24L01:
-    def __init__(self, spi, cs, ce, channel=46, payload_size=16):
+    def __init__(
+        self,
+        spi,
+        cs,
+        ce,
+        channel=46,
+        payload_size=16,
+        spi_baudrate=1000000,
+        startup_delay_ms=100,
+    ):
         assert payload_size <= 32
 
         self.buf = bytearray(1)
@@ -61,7 +70,8 @@ class NRF24L01:
         self.ce = ce
 
         # init the SPI bus and pins
-        self.init_spi(4000000)
+        # 1MHz is more reliable on jumper wires than 4MHz
+        self.init_spi(spi_baudrate)
 
         # reset everything
         ce.init(ce.OUT, value=0)
@@ -69,12 +79,14 @@ class NRF24L01:
 
         self.payload_size = payload_size
         self.pipe0_read_addr = None
-        utime.sleep_ms(5)
+        utime.sleep_ms(startup_delay_ms)
 
         # set address width to 5 bytes and check for device present
         self.reg_write(SETUP_AW, 0b11)
         if self.reg_read(SETUP_AW) != 0b11:
-            raise OSError("nRF24L01+ Hardware not responding")
+            raise OSError(
+                "nRF24L01+ Hardware not responding (check wiring, 3.3V power, and CE/CSN pins)"
+            )
 
         # disable dynamic payloads
         self.reg_write(DYNPD, 0)
