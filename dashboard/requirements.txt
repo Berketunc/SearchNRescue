@@ -1,0 +1,6 @@
+# IoT Sensor Network Dashboard — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+nicegui>=1.4.0
+pyserial>=3.5
+plotly>=5.20.0
