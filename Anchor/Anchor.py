@@ -47,50 +47,62 @@ next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
 print("Anchor Mirroring Mode...")
 
 
-def _decode_distance_cm(packet):
+def _decode_packet(packet):
     """
-    Try to decode a distance payload sent by Scout.
+    Decode tagged telemetry payload sent by Scout.
+    Returns tuple (kind, value) where:
+    - ("gyro", (gx, gy, gz))
+    - ("distance", distance_cm)
+    - (None, None) if unknown
+
     Supported packet formats:
+    - b"G" + 3x int16 little-endian (gyro in centi-deg/s)
     - ASCII float (e.g. b"123.4")
     - 2-byte unsigned int, little-endian, distance in cm
     - 4-byte float32, little-endian, distance in cm
-    Returns float distance in cm, or None if not recognized.
     """
     # nRF fixed payloads are often right-padded with zeros.
     data = packet.rstrip(b"\x00")
     if not data:
-        return None
+        return (None, None)
+
+    if data[0] == 71 and len(data) >= 7:  # ord('G')
+        gx_i, gy_i, gz_i = ustruct.unpack("<hhh", data[1:7])
+        return ("gyro", (gx_i / 100.0, gy_i / 100.0, gz_i / 100.0))
 
     # Optional prefix support, e.g. b"D:123.4"
     if data.startswith(b"D:"):
         data = data[2:]
         if not data:
-            return None
+            return (None, None)
 
     # 1) ASCII number
     try:
-        return float(data.decode("ascii"))
+        return ("distance", float(data.decode("ascii")))
     except Exception:
         pass
 
     # 2) uint16 cm
     if len(data) == 2:
-        return float(ustruct.unpack("<H", data)[0])
+        return ("distance", float(ustruct.unpack("<H", data)[0]))
 
     # 3) float32 cm
     if len(data) == 4:
-        return float(ustruct.unpack("<f", data)[0])
+        return ("distance", float(ustruct.unpack("<f", data)[0]))
 
-    return None
+    return (None, None)
 
 while True:
     if nrf is not None and nrf.any():
         while nrf.any():
             buf = nrf.recv()
-            distance_cm = _decode_distance_cm(buf)
+            kind, value = _decode_packet(buf)
 
-            if distance_cm is not None:
-                print("Received Distance: {:.1f} cm".format(distance_cm))
+            if kind == "gyro":
+                gx, gy, gz = value
+                print("Received Gyro: gx={:.2f} gy={:.2f} gz={:.2f} deg/s".format(gx, gy, gz))
+            elif kind == "distance":
+                print("Received Distance: {:.1f} cm".format(value))
             else:
                 state = buf[0]  # backward compatibility with old 1-byte packets
                 led.value(state)
