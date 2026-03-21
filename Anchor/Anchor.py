@@ -1,6 +1,7 @@
 from machine import Pin, SPI
 from nrf24l01 import NRF24L01
 import utime
+import ustruct
 
 # Optional runtime override injected by dashboard launcher.
 USE_GP15_LED = bool(globals().get("USE_GP15_LED", False))
@@ -20,7 +21,7 @@ def init_radio(max_attempts=5):
                 spi,
                 Pin(cfg["csn"]),
                 Pin(cfg["ce"]),
-                payload_size=1,
+                payload_size=16,
                 spi_baudrate=1_000_000,
                 startup_delay_ms=120,
             )
@@ -45,14 +46,55 @@ next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
 
 print("Anchor Mirroring Mode...")
 
+
+def _decode_distance_cm(packet):
+    """
+    Try to decode a distance payload sent by Scout.
+    Supported packet formats:
+    - ASCII float (e.g. b"123.4")
+    - 2-byte unsigned int, little-endian, distance in cm
+    - 4-byte float32, little-endian, distance in cm
+    Returns float distance in cm, or None if not recognized.
+    """
+    # nRF fixed payloads are often right-padded with zeros.
+    data = packet.rstrip(b"\x00")
+    if not data:
+        return None
+
+    # Optional prefix support, e.g. b"D:123.4"
+    if data.startswith(b"D:"):
+        data = data[2:]
+        if not data:
+            return None
+
+    # 1) ASCII number
+    try:
+        return float(data.decode("ascii"))
+    except Exception:
+        pass
+
+    # 2) uint16 cm
+    if len(data) == 2:
+        return float(ustruct.unpack("<H", data)[0])
+
+    # 3) float32 cm
+    if len(data) == 4:
+        return float(ustruct.unpack("<f", data)[0])
+
+    return None
+
 while True:
     if nrf is not None and nrf.any():
         while nrf.any():
             buf = nrf.recv()
-            state = buf[0] # The byte we sent
+            distance_cm = _decode_distance_cm(buf)
 
-            led.value(state) # MIMIC the Scout
-            print(f"Received Mimic: {state}")
+            if distance_cm is not None:
+                print("Received Distance: {:.1f} cm".format(distance_cm))
+            else:
+                state = buf[0]  # backward compatibility with old 1-byte packets
+                led.value(state)
+                print(f"Received Mimic: {state}")
 
     # background retry if radio was unavailable
     if nrf is None and utime.ticks_diff(utime.ticks_ms(), next_retry_ms) >= 0:

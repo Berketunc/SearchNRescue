@@ -1,10 +1,13 @@
-from machine import Pin, SPI
+from machine import Pin, SPI, time_pulse_us
 from nrf24l01 import NRF24L01
 import utime
 
-# 1. Setup LED and Button
-led = Pin("LED", Pin.OUT) 
-button = Pin(15, Pin.IN, Pin.PULL_UP) # Button between GP15 and GND
+# 1. Setup LED and HC-SR04
+led = Pin("LED", Pin.OUT)
+trig = Pin(3, Pin.OUT)   # TRIG on GP6
+echo = Pin(2, Pin.IN)    # ECHO on GP7
+trig.value(0)
+utime.sleep_ms(2)
 
 # 2. Setup SPI and Radio
 spi = SPI(0, sck=Pin(18), mosi=Pin(19), miso=Pin(16))
@@ -18,7 +21,7 @@ def init_radio(max_attempts=5):
                 spi,
                 Pin(cfg["csn"]),
                 Pin(cfg["ce"]),
-                payload_size=1,
+                payload_size=16,
                 spi_baudrate=1_000_000,
                 startup_delay_ms=120,
             )
@@ -49,36 +52,42 @@ if nrf is not None:
 
 print("Scout Sending Mode...")
 
-last_state = -1
+
+def read_distance_cm():
+    trig.value(0)
+    utime.sleep_us(2)
+    trig.value(1)
+    utime.sleep_us(10)
+    trig.value(0)
+
+    duration = time_pulse_us(echo, 1, 30000)
+    if duration < 0:
+        return None
+    return duration / 58.0
 
 while True:
-    # State: 1 if pressed (0V), 0 if released (3.3V)
-    current_state = 1 if button.value() == 0 else 0
-    
-    if current_state != last_state:
-        led.value(current_state) # Local Feedback
-        
-        if nrf is None:
-            print(f"State changed (radio offline): {current_state}")
-            last_state = current_state
-        else:
-            # Transmission
-            nrf.stop_listening()
-            try:
-                # We send a 1-byte state
-                nrf.send(bytes([current_state]))
-                print(f"Sent: {current_state}")
-                last_state = current_state
-            except OSError as exc:
-                msg = str(exc)
-                if msg in ("send failed", "timed out"):
-                    print("Anchor not responding (packet not acknowledged)")
-                    # avoid spamming retries for unchanged button state
-                    last_state = current_state
-                else:
-                    print("Radio hardware error; entering offline mode")
-                    nrf = None
-                    next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
+    distance_cm = read_distance_cm()
+
+    if distance_cm is None:
+        print("No reading")
+    elif nrf is None:
+        print("Distance: {:.1f} cm (radio offline)".format(distance_cm))
+    else:
+        # ASCII payload keeps cross-language decoding simple.
+        payload = "{:.1f}".format(distance_cm).encode("ascii")
+        nrf.stop_listening()
+        try:
+            nrf.send(payload)
+            led.toggle()
+            print("Sent Distance: {:.1f} cm".format(distance_cm))
+        except OSError as exc:
+            msg = str(exc)
+            if msg in ("send failed", "timed out"):
+                print("Anchor not responding (packet not acknowledged)")
+            else:
+                print("Radio hardware error; entering offline mode")
+                nrf = None
+                next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
 
     # background retry if radio was unavailable
     if nrf is None and utime.ticks_diff(utime.ticks_ms(), next_retry_ms) >= 0:
@@ -87,4 +96,4 @@ while True:
             configure_radio(nrf)
         next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
             
-    utime.sleep_ms(20) # Smooth polling
+    utime.sleep_ms(500)
