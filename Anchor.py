@@ -2,8 +2,11 @@ from machine import Pin, SPI
 from nrf24l01 import NRF24L01
 import utime
 
+# Optional runtime override injected by dashboard launcher.
+USE_GP15_LED = bool(globals().get("USE_GP15_LED", False))
+
 # 1. Setup LED
-led = Pin("LED", Pin.OUT)
+led = Pin(15 if USE_GP15_LED else "LED", Pin.OUT)
 
 # 2. Setup SPI and Radio
 spi = SPI(0, sck=Pin(18), mosi=Pin(19), miso=Pin(16))
