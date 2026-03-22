@@ -10,6 +10,7 @@ import os
 import math
 import time
 import csv
+import shutil
 import subprocess
 import threading
 from datetime import datetime
@@ -666,6 +667,7 @@ class DashboardWindow(QMainWindow):
         self._anchor_proc    = None
         self._anchor_reader  = None
         self._anchor_running = False
+        self._connected_port = None
         self._csv_file       = None
         self._csv_writer     = None
         self._csv_path       = None
@@ -1070,6 +1072,22 @@ class DashboardWindow(QMainWindow):
         else:
             self.port_combo.addItem("(none)")
 
+    def _pick_anchor_port(self):
+        """Pick a likely Anchor Pico port (not the telemetry/Scout COM port)."""
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        in_use = self._connected_port
+
+        if in_use:
+            candidates = [p for p in ports if p != in_use]
+            if candidates:
+                return candidates[0]
+            # If only telemetry port is visible, let mpremote auto-detect
+            # This handles the case where Anchor Pico is on same physical device
+            return "auto"
+
+        # No port connected, return auto-detect
+        return "auto"
+
     def _on_connect(self):
         port = self.port_combo.currentText()
         if port in ("", "(none)"):
@@ -1082,6 +1100,7 @@ class DashboardWindow(QMainWindow):
         self._serial_thread.line_received.connect(self._on_serial_line)
         self._serial_thread.telemetry.connect(self._on_telemetry)
         self._serial_thread.start()
+        self._connected_port = port
 
         self.status_badge.setText(f"● Connected — {port} @ 115200 baud")
         self.status_badge.setStyleSheet(
@@ -1092,11 +1111,20 @@ class DashboardWindow(QMainWindow):
         self.disconnect_btn.setEnabled(True)
         self._log(f"[SERIAL] Connected to {port} @ 115200", color=ACCENT2)
 
+        # Auto-launch Anchor.py as soon as serial connects
+        if not self._anchor_running:
+            self._start_anchor()
+
     def _on_disconnect(self):
         if self._serial_thread:
             self._serial_thread.stop()
             self._serial_thread.wait(2000)
             self._serial_thread = None
+        self._connected_port = None
+
+        # Stop Anchor process when serial disconnects
+        if self._anchor_running:
+            self._stop_anchor()
 
         self.status_badge.setText("● NOT CONNECTED")
         self.status_badge.setStyleSheet(
@@ -1116,22 +1144,85 @@ class DashboardWindow(QMainWindow):
             self._start_anchor()
 
     def _start_anchor(self):
-        anchor_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "Anchor.py"
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
         )
-        if not os.path.exists(anchor_path):
-            self._log(f"[ERROR] Anchor.py not found at: {anchor_path}", color=DANGER)
+        anchor_candidates = [
+            os.path.join(project_root, "Anchor", "Anchor.py"),
+            os.path.join(project_root, "Anchor.py"),
+        ]
+        anchor_path = next((p for p in anchor_candidates if os.path.exists(p)), None)
+        if not anchor_path:
+            self._log(
+                "[ERROR] Anchor.py not found. Expected Anchor/Anchor.py or Anchor.py",
+                color=DANGER,
+            )
             return
 
+        mpremote = shutil.which("mpremote")
+        if not mpremote:
+            self._log(
+                "[ERROR] mpremote not found. Install it so Anchor.py runs on Pico.",
+                color=DANGER,
+            )
+            return
+
+        anchor_port = self._pick_anchor_port()
+        if not anchor_port:
+            self._log(
+                "[ERROR] Anchor Pico port not found. Connect Anchor on a different COM port than telemetry.",
+                color=DANGER,
+            )
+            return
+
+        # Temporarily disconnect telemetry serial to allow mpremote to access the device
+        was_serial_running = False
+        if self._serial_thread and self._serial_thread.isRunning():
+            was_serial_running = True
+            self._log("[ANCHOR] Pausing telemetry to allow mpremote device access...", color=WARN)
+            self._serial_thread.stop()
+            self._serial_thread.wait(1000)
+            time.sleep(0.5)  # Give OS time to release the port
+
         try:
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            existing_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = (
+                project_root if not existing_pp else f"{project_root}{os.pathsep}{existing_pp}"
+            )
+
+            # Build command: if anchor_port is "auto", skip the connect part
+            if anchor_port == "auto":
+                cmd = [mpremote, "run", anchor_path]
+            else:
+                cmd = [mpremote, "connect", anchor_port, "run", anchor_path]
+
             self._anchor_proc = subprocess.Popen(
-                [sys.executable, anchor_path],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                bufsize=1
+                bufsize=1,
+                cwd=project_root,
+                env=env,
             )
+            
+            # Restart telemetry after spawning mpremote
+            if was_serial_running:
+                time.sleep(0.5)
+                self._serial_thread = SerialReaderThread(self._connected_port, 115200)
+                self._serial_thread.line_received.connect(self._on_serial_line)
+                self._serial_thread.telemetry.connect(self._on_telemetry)
+                self._serial_thread.start()
+                self._log("[ANCHOR] Telemetry resumed.", color=ACCENT2)
         except Exception as e:
             self._log(f"[ERROR] Could not launch Anchor.py: {e}", color=DANGER)
+            # Ensure telemetry restarts even on error
+            if was_serial_running and not self._serial_thread.isRunning():
+                self._serial_thread = SerialReaderThread(self._connected_port, 115200)
+                self._serial_thread.line_received.connect(self._on_serial_line)
+                self._serial_thread.telemetry.connect(self._on_telemetry)
+                self._serial_thread.start()
             return
 
         self._anchor_reader = AnchorReader(self._anchor_proc)
@@ -1143,7 +1234,7 @@ class DashboardWindow(QMainWindow):
 
         self._anchor_running = True
         self._update_anchor_btn(running=True)
-        self._log("[ANCHOR] Anchor.py started.", color=ACCENT2)
+        self._log(f"[ANCHOR] Anchor.py started on Pico via mpremote ({anchor_port}).", color=ACCENT2)
 
     def _stop_anchor(self):
         if self._anchor_proc:
@@ -1168,6 +1259,9 @@ class DashboardWindow(QMainWindow):
         self._log("[ANCHOR] Anchor.py process exited.", color=WARN)
 
     def _update_anchor_btn(self, running):
+        if not hasattr(self, "anchor_btn"):
+            return
+
         if running:
             self.anchor_btn.setText("■ STOP")
             self.anchor_btn.setStyleSheet(f"""

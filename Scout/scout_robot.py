@@ -26,16 +26,38 @@
 
 import utime as _utime
 import ujson
+import os
 
 # ── 1. Load Scout.py setup (radio, LED, pipes) without its loop
 _scout_lines = []
-with open("Scout.py") as _f:
+_scout_candidates = [
+    os.path.join(os.path.dirname(__file__), "scout.py"),
+    os.path.join(os.path.dirname(__file__), "Scout.py"),
+    "scout.py",
+    "Scout.py",
+]
+_scout_file = next((p for p in _scout_candidates if os.path.exists(p)), None)
+if _scout_file is None:
+    raise OSError("scout.py not found beside scout_robot.py")
+
+with open(_scout_file) as _f:
     for _line in _f:
         if _line.strip().startswith("while True:"):
             break
         _scout_lines.append(_line)
 exec("".join(_scout_lines), globals())
 # nrf, init_radio, next_retry_ms, pipes now live here
+
+# Resolve names injected by Scout bootstrap explicitly.
+init_radio = globals().get("init_radio")
+nrf = globals().get("nrf")
+next_retry_ms = globals().get("next_retry_ms")
+pipes = globals().get("pipes")
+
+if init_radio is None:
+    raise RuntimeError("Scout bootstrap missing init_radio")
+if next_retry_ms is None or pipes is None:
+    raise RuntimeError("Scout bootstrap missing next_retry_ms/pipes")
 
 # ── 2. Hardware modules
 from control.radar    import Radar
