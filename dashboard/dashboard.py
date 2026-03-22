@@ -253,7 +253,7 @@ class RadarNodeMap(QWidget):
         self._last_input_angle = None
         self._sweep_timer_ms = 30
         self._sweep_step_deg = 2.0
-        self.max_distance_cm = 200.0
+        self.max_distance_cm = 70.0
         self.alert_distance_cm = 40.0
         self.nodes = []       # list of (angle_deg, distance_fraction, label)
         self.blips = []       # [(x_frac, y_frac, age, is_alert)]
@@ -394,6 +394,13 @@ class RadarNodeMap(QWidget):
                 180 * 16,
                 -180 * 16,
             )
+            p.setPen(QPen(qc(TEXT_DIM), 1))
+            p.setFont(QFont(MONO, 7))
+            p.drawText(
+                QRectF(cx + rr - 24, cy - 12, 48, 12),
+                Qt.AlignmentFlag.AlignCenter,
+                f"{int(round(self.max_distance_cm * frac))}cm",
+            )
 
         # 0..180 angle ticks + numeric labels
         p.setPen(QPen(QColor(0, 190, 70, 120), 1))
@@ -483,12 +490,26 @@ class RadarNodeMap(QWidget):
             if is_alert:
                 blip_col = QColor(255, 56, 96, alpha)
             else:
-                blip_col = QColor(0, 255, 120, alpha)
+                # Normal echo trail (non-alert) uses cyan to stand out from green grid.
+                blip_col = QColor(0, 220, 255, alpha)
             p.setBrush(QBrush(blip_col))
             p.setPen(Qt.PenStyle.NoPen)
             px = cx + (bx - 0.5) * 2 * r
             py = cy + (by - 0.5) * 2 * r
             p.drawEllipse(QPointF(px, py), size, size)
+
+        p.setPen(QPen(qc(TEXT_DIM), 1))
+        p.setFont(QFont(MONO, 7))
+        p.drawText(
+            QRectF(cx - r + 6, cy - r + 6, 120, 12),
+            Qt.AlignmentFlag.AlignLeft,
+            f"RANGE 0-{int(self.max_distance_cm)}cm",
+        )
+        p.drawText(
+            QRectF(cx - r + 6, cy - r + 18, 160, 12),
+            Qt.AlignmentFlag.AlignLeft,
+            "CYAN=echo  RED=alert",
+        )
 
         # bezel (top semicircle)
         p.setClipping(False)
@@ -778,7 +799,13 @@ class SerialReaderThread(QThread):
         try:
             ser = serial.Serial(self.port, self.baud, timeout=1)
         except Exception as e:
-            self.line_received.emit(f"[SERIAL ERROR] {e}")
+            msg = str(e)
+            if isinstance(e, PermissionError) or "Access is denied" in msg:
+                self.line_received.emit(
+                    f"[SERIAL ERROR] {msg} | Port {self.port} is busy. Close MicroPico/vREPL/Serial Monitor or any app using this COM port."
+                )
+            else:
+                self.line_received.emit(f"[SERIAL ERROR] {e}")
             return
 
         while not self._stop.is_set():
@@ -1438,12 +1465,12 @@ class DashboardWindow(QMainWindow):
             return
 
         mpremote = shutil.which("mpremote")
+        mpremote_cmd = [mpremote] if mpremote else [sys.executable, "-m", "mpremote"]
         if not mpremote:
             self._log(
-                "[ERROR] mpremote not found. Install it so Anchor.py runs on Pico.",
-                color=DANGER,
+                "[ANCHOR] mpremote executable not on PATH; using python -m mpremote.",
+                color=WARN,
             )
-            return
 
         anchor_port = self._pick_anchor_port()
         if not anchor_port:
@@ -1472,9 +1499,9 @@ class DashboardWindow(QMainWindow):
 
             # Build command: if anchor_port is "auto", skip the connect part
             if anchor_port == "auto":
-                cmd = [mpremote, "run", anchor_path]
+                cmd = mpremote_cmd + ["run", anchor_path]
             else:
-                cmd = [mpremote, "connect", anchor_port, "run", anchor_path]
+                cmd = mpremote_cmd + ["connect", anchor_port, "run", anchor_path]
 
             self._anchor_proc = subprocess.Popen(
                 cmd,
