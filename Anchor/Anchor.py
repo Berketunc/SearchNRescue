@@ -3,6 +3,8 @@ from nrf24l01 import NRF24L01
 import utime
 import ustruct
 
+PAYLOAD_SIZE = 19  # b'T' + <Hhhhhhhhh>
+
 # Optional runtime override injected by dashboard launcher.
 USE_GP15_LED = bool(globals().get("USE_GP15_LED", False))
 
@@ -21,7 +23,7 @@ def init_radio(max_attempts=5):
                 spi,
                 Pin(cfg["csn"]),
                 Pin(cfg["ce"]),
-                payload_size=16,
+                payload_size=PAYLOAD_SIZE,
                 spi_baudrate=1_000_000,
                 startup_delay_ms=120,
             )
@@ -51,13 +53,14 @@ def _decode_packet(packet):
     """
     Decode tagged telemetry payload sent by Scout.
     Returns tuple (kind, value) where:
-    - ("telemetry", (distance_cm_or_none, gx, gy, gz))
+    - ("telemetry", (distance_cm_or_none, gx, gy, gz, pitch, roll, ax, ay, az))
     - ("gyro", (gx, gy, gz))
     - ("distance", distance_cm)
     - (None, None) if unknown
 
     Supported packet formats:
-    - b"T" + uint16 distance_cm + 3x int16 little-endian gyro (centi-deg/s)
+        - b"T" + uint16 distance_cm + 8x int16 little-endian:
+            gx, gy, gz (centi-deg/s), pitch, roll (centi-deg), ax, ay, az (centi-m/s^2)
     - b"G" + 3x int16 little-endian (gyro in centi-deg/s)
     - ASCII float (e.g. b"123.4")
     - 2-byte unsigned int, little-endian, distance in cm
@@ -68,12 +71,34 @@ def _decode_packet(packet):
     if not data:
         return (None, None)
 
-    if data[0] == 84 and len(data) >= 9:  # ord('T')
+    if data[0] == 84 and len(data) >= 19:  # ord('T') full telemetry
+        dist_i, gx_i, gy_i, gz_i, pitch_i, roll_i, ax_i, ay_i, az_i = ustruct.unpack(
+            "<Hhhhhhhhh", data[1:19]
+        )
+        distance_cm = None if dist_i == 0xFFFF else float(dist_i)
+        if gx_i == -32768 and gy_i == -32768 and gz_i == -32768:
+            return ("telemetry", (distance_cm, None, None, None, None, None, None, None, None))
+        return (
+            "telemetry",
+            (
+                distance_cm,
+                gx_i / 100.0,
+                gy_i / 100.0,
+                gz_i / 100.0,
+                pitch_i / 100.0,
+                roll_i / 100.0,
+                ax_i / 100.0,
+                ay_i / 100.0,
+                az_i / 100.0,
+            ),
+        )
+
+    if data[0] == 84 and len(data) >= 9:  # ord('T') legacy telemetry
         dist_i, gx_i, gy_i, gz_i = ustruct.unpack("<Hhhh", data[1:9])
         distance_cm = None if dist_i == 0xFFFF else float(dist_i)
         if gx_i == -32768 and gy_i == -32768 and gz_i == -32768:
-            return ("telemetry", (distance_cm, None, None, None))
-        return ("telemetry", (distance_cm, gx_i / 100.0, gy_i / 100.0, gz_i / 100.0))
+            return ("telemetry", (distance_cm, None, None, None, None, None, None, None, None))
+        return ("telemetry", (distance_cm, gx_i / 100.0, gy_i / 100.0, gz_i / 100.0, None, None, None, None, None))
 
     if data[0] == 71 and len(data) >= 7:  # ord('G')
         gx_i, gy_i, gz_i = ustruct.unpack("<hhh", data[1:7])
@@ -108,16 +133,35 @@ while True:
             kind, value = _decode_packet(buf)
 
             if kind == "telemetry":
-                distance_cm, gx, gy, gz = value
+                distance_cm, gx, gy, gz, pitch, roll, ax, ay, az = value
                 d_label = "None" if distance_cm is None else "{:.1f} cm".format(distance_cm)
                 if gx is None:
-                    print("Received Telemetry: d={} gx=None gy=None gz=None".format(d_label))
-                else:
                     print(
-                        "Received Telemetry: d={} gx={:.2f} gy={:.2f} gz={:.2f} deg/s".format(
-                            d_label, gx, gy, gz
+                        "Received Telemetry: d={} gx=None gy=None gz=None pitch=None roll=None ax=None ay=None az=None".format(
+                            d_label
                         )
                     )
+                else:
+                    if pitch is None:
+                        print(
+                            "Received Telemetry: d={} gx={:.2f} gy={:.2f} gz={:.2f} deg/s".format(
+                                d_label, gx, gy, gz
+                            )
+                        )
+                    else:
+                        print(
+                            "Received Telemetry: d={} gx={:.2f} gy={:.2f} gz={:.2f} deg/s pitch={:.2f} roll={:.2f} ax={:.2f} ay={:.2f} az={:.2f}".format(
+                                d_label,
+                                gx,
+                                gy,
+                                gz,
+                                pitch,
+                                roll,
+                                ax,
+                                ay,
+                                az,
+                            )
+                        )
             elif kind == "gyro":
                 gx, gy, gz = value
                 print("Received Gyro: gx={:.2f} gy={:.2f} gz={:.2f} deg/s".format(gx, gy, gz))
