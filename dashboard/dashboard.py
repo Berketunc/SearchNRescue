@@ -256,7 +256,7 @@ class RadarNodeMap(QWidget):
         self.max_distance_cm = 70.0
         self.alert_distance_cm = 40.0
         self.nodes = []       # list of (angle_deg, distance_fraction, label)
-        self.blips = []       # [(x_frac, y_frac, age, is_alert)]
+        self.blips = []       # [(x_frac, y_frac, distance_fraction, angle_deg, passes_left)]
         self.setMinimumSize(160, 160)
 
         self._sweep_timer = QTimer(self)
@@ -277,6 +277,7 @@ class RadarNodeMap(QWidget):
         self._sweep_step_deg = current_speed * (self._sweep_timer_ms / 1000.0)
 
     def _advance_sweep(self):
+        prev_angle = self.sweep_angle
         self.sweep_angle += self._sweep_step_deg * self._sweep_dir
         if self.sweep_angle >= 180:
             self.sweep_angle = 180
@@ -285,15 +286,24 @@ class RadarNodeMap(QWidget):
             self.sweep_angle = 0
             self._sweep_dir = 1
 
-        # age blips
-        self.blips = [(x, y, a + 0.01, alert) for x, y, a, alert in self.blips if a < 1.0]
-        # generate new blip for each node near sweep
+        if self.blips:
+            lo = min(prev_angle, self.sweep_angle)
+            hi = max(prev_angle, self.sweep_angle)
+            kept = []
+            for bx, by, dist, bang, passes_left in self.blips:
+                new_passes_left = passes_left
+                if lo <= bang <= hi:
+                    new_passes_left -= 1
+                if new_passes_left > 0:
+                    kept.append((bx, by, dist, bang, new_passes_left))
+            self.blips = kept
+
+        # Generate/update a blip for each node near the current sweep angle.
         for node in self.nodes:
             if len(node) >= 4:
-                ang, dist, label, is_alert = node
+                ang, dist, label, _ = node
             else:
                 ang, dist, label = node
-                is_alert = False
 
             # Keep the center intentionally empty for future overlays.
             if dist <= 0.05:
@@ -303,10 +313,14 @@ class RadarNodeMap(QWidget):
                 rad = math.radians(ang)
                 fx = 0.5 + dist * math.cos(rad) * 0.5
                 fy = 0.5 - dist * math.sin(rad) * 0.5
-                # avoid duplicates
-                if not any(abs(x - fx) < 0.02 and abs(y - fy) < 0.02
-                           for x, y, _, _ in self.blips):
-                    self.blips.append((fx, fy, 0.0, is_alert))
+                replaced = False
+                for i, (x, y, _, _, _) in enumerate(self.blips):
+                    if abs(x - fx) < 0.02 and abs(y - fy) < 0.02:
+                        self.blips[i] = (fx, fy, dist, ang, 2)
+                        replaced = True
+                        break
+                if not replaced:
+                    self.blips.append((fx, fy, dist, ang, 2))
         self.update()
 
     def set_nodes(self, nodes):
@@ -314,15 +328,14 @@ class RadarNodeMap(QWidget):
         filtered = []
         for node in nodes:
             if len(node) >= 4:
-                ang, dist, label, is_alert = node
+                ang, dist, label, _ = node
             else:
                 ang, dist, label = node
-                is_alert = False
 
             if dist <= 0.05:
                 continue
             if 0 <= ang <= 180:
-                filtered.append((ang, dist, label, is_alert))
+                filtered.append((ang, dist, label))
         self.nodes = filtered
         self.update()
 
@@ -345,7 +358,10 @@ class RadarNodeMap(QWidget):
 
                 angle = raw if self._input_phase > 0 else (180.0 - raw)
 
-                self._sweep_dir = 1 if angle >= self.sweep_angle else -1
+                if angle > self.sweep_angle + 0.1:
+                    self._sweep_dir = 1
+                elif angle < self.sweep_angle - 0.1:
+                    self._sweep_dir = -1
                 self.sweep_angle = angle
                 self._last_input_angle = raw
             except Exception:
@@ -356,11 +372,17 @@ class RadarNodeMap(QWidget):
         if dist_frac <= 0.05:
             return
 
-        is_alert = d < self.alert_distance_cm
         rad = math.radians(self.sweep_angle)
         fx = 0.5 + dist_frac * math.cos(rad) * 0.5
         fy = 0.5 - dist_frac * math.sin(rad) * 0.5
-        self.blips.append((fx, fy, 0.0, is_alert))
+        replaced = False
+        for i, (x, y, _, _, _) in enumerate(self.blips):
+            if abs(x - fx) < 0.02 and abs(y - fy) < 0.02:
+                self.blips[i] = (fx, fy, dist_frac, self.sweep_angle, 2)
+                replaced = True
+                break
+        if not replaced:
+            self.blips.append((fx, fy, dist_frac, self.sweep_angle, 2))
         self.update()
 
     def paintEvent(self, _):
@@ -482,16 +504,13 @@ class RadarNodeMap(QWidget):
 
         # blips
         p.setClipping(False)
-        for bx, by, age, is_alert in self.blips:
+        for bx, by, dist_frac, _, _ in self.blips:
             if by > 0.5:
                 continue
-            alpha = int(255 * (1 - age))
-            size  = 6 * (1 - age * 0.5)
-            if is_alert:
-                blip_col = QColor(255, 56, 96, alpha)
-            else:
-                # Normal echo trail (non-alert) uses cyan to stand out from green grid.
-                blip_col = QColor(0, 220, 255, alpha)
+            closeness = max(0.0, min(1.0, 1.0 - dist_frac))
+            alpha = int(70 + 185 * closeness)
+            size = 3.0 + 4.0 * closeness
+            blip_col = QColor(255, 56, 56, alpha)
             p.setBrush(QBrush(blip_col))
             p.setPen(Qt.PenStyle.NoPen)
             px = cx + (bx - 0.5) * 2 * r
@@ -508,7 +527,7 @@ class RadarNodeMap(QWidget):
         p.drawText(
             QRectF(cx - r + 6, cy - r + 18, 160, 12),
             Qt.AlignmentFlag.AlignLeft,
-            "CYAN=echo  RED=alert",
+            "RED dots: brighter = closer",
         )
 
         # bezel (top semicircle)
