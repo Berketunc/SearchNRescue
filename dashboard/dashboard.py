@@ -13,6 +13,7 @@ import csv
 import shutil
 import subprocess
 import threading
+import re
 from datetime import datetime
 import serial
 import serial.tools.list_ports
@@ -394,29 +395,80 @@ class BarGraph(QWidget):
 class AccelReadout(QWidget):
     def __init__(self):
         super().__init__()
-        self.ax = 0.0
-        self.ay = 0.0
-        self.az = 9.81
+        self.ax = None
+        self.ay = None
+        self.az = None
+        self.has_data = False
+        self._smooth_ax = None
+        self._smooth_ay = None
+        self._smooth_az = None
+        self._display_range = 20.0
         self.history_x = [0.0] * 60
         self.history_y = [0.0] * 60
-        self.history_z = [9.81] * 60
+        self.history_z = [0.0] * 60
         self.setMinimumSize(140, 120)
 
     def set_accel(self, ax, ay, az):
-        self.ax = ax
-        self.ay = ay
-        self.az = az
-        self.history_x.append(ax); self.history_x.pop(0)
-        self.history_y.append(ay); self.history_y.pop(0)
-        self.history_z.append(az); self.history_z.pop(0)
+        if ax is None or ay is None or az is None:
+            return
+
+        # Light smoothing keeps the traces readable when samples are noisy/spiky.
+        alpha = 0.35
+        self._smooth_ax = ax if self._smooth_ax is None else (self._smooth_ax * (1 - alpha) + ax * alpha)
+        self._smooth_ay = ay if self._smooth_ay is None else (self._smooth_ay * (1 - alpha) + ay * alpha)
+        self._smooth_az = az if self._smooth_az is None else (self._smooth_az * (1 - alpha) + az * alpha)
+
+        sx = self._smooth_ax
+        sy = self._smooth_ay
+        sz = self._smooth_az
+
+        self.ax = sx
+        self.ay = sy
+        self.az = sz
+
+        if not self.has_data:
+            # Avoid long flat-left section when the first packet arrives.
+            self.history_x = [sx] * 60
+            self.history_y = [sy] * 60
+            self.history_z = [sz] * 60
+            self.has_data = True
+            self.update()
+            return
+
+        self.has_data = True
+        self.history_x.append(sx); self.history_x.pop(0)
+        self.history_y.append(sy); self.history_y.pop(0)
+        self.history_z.append(sz); self.history_z.pop(0)
         self.update()
 
-    def _draw_trace(self, p, history, col, w, h, offset_y, scale):
+    def clear_data(self):
+        self.ax = None
+        self.ay = None
+        self.az = None
+        self.has_data = False
+        self._smooth_ax = None
+        self._smooth_ay = None
+        self._smooth_az = None
+        self._display_range = 20.0
+        self.history_x = [0.0] * 60
+        self.history_y = [0.0] * 60
+        self.history_z = [0.0] * 60
+        self.update()
+
+    def _update_display_range(self):
+        all_vals = self.history_x + self.history_y + self.history_z
+        max_abs = max(abs(v) for v in all_vals) if all_vals else 0.0
+        target = max(8.0, min(260.0, max_abs * 1.25))
+        self._display_range = self._display_range * 0.85 + target * 0.15
+
+    def _draw_trace(self, p, history, col, w, h, offset_y):
         path = QPainterPath()
         n = len(history)
+        # Keep the trace inside the chart with adaptive range.
+        px_per_unit = (h * 0.42) / max(self._display_range, 1e-3)
         for i, v in enumerate(history):
             x = i * w / n
-            y = offset_y - v * scale
+            y = offset_y - v * px_per_unit
             if i == 0:
                 path.moveTo(x, y)
             else:
@@ -432,14 +484,43 @@ class AccelReadout(QWidget):
         # background
         p.fillRect(0, 0, w, h, QBrush(qc(BG_CARD)))
 
+        if not self.has_data:
+            p.setPen(QPen(qc(TEXT_DIM)))
+            p.setFont(QFont(SANS, 9, QFont.Weight.Medium))
+            p.drawText(
+                QRectF(0, 0, w, h),
+                Qt.AlignmentFlag.AlignCenter,
+                "Waiting for data",
+            )
+            return
+
         # traces (clip upper area so text never overlaps)
         trace_h = max(28, h - 46)
         mid = trace_h // 2
+
+        self._update_display_range()
+
+        # grid + center line for readability
+        p.setPen(QPen(QColor(80, 120, 170, 40), 1))
+        for frac in (0.2, 0.4, 0.6, 0.8):
+            y = int(trace_h * frac)
+            p.drawLine(0, y, w, y)
+        p.setPen(QPen(QColor(120, 170, 220, 85), 1))
+        p.drawLine(0, mid, w, mid)
+
+        # scale hints
+        scale_font = QFont(MONO, 7)
+        p.setFont(scale_font)
+        p.setPen(QPen(qc(TEXT_DIM)))
+        rng = self._display_range
+        p.drawText(4, 10, f"+{rng:.0f}")
+        p.drawText(4, trace_h - 2, f"-{rng:.0f}")
+
         p.save()
         p.setClipRect(0, 0, w, trace_h)
-        self._draw_trace(p, self.history_x, DANGER,  w, trace_h, mid, 4)
-        self._draw_trace(p, self.history_y, ACCENT2, w, trace_h, mid, 4)
-        self._draw_trace(p, self.history_z, ACCENT,  w, trace_h, mid, 2)
+        self._draw_trace(p, self.history_x, DANGER,  w, trace_h, mid)
+        self._draw_trace(p, self.history_y, ACCENT2, w, trace_h, mid)
+        self._draw_trace(p, self.history_z, ACCENT,  w, trace_h, mid)
         p.restore()
 
         # current values
@@ -551,14 +632,39 @@ class SerialReaderThread(QThread):
         PITCH:0.0,ROLL:0.0,HEADING:0,ALT:0.0,AX:0.00,AY:0.00,AZ:9.81,RSSI:-80
         """
         data = {}
+
+        def parse_num(raw):
+            value = raw.strip()
+            if value.upper() in {"NONE", "NULL", "N/A", "NA", "-"}:
+                return None
+            # Handles values like "326.0cm" by reading the leading number.
+            match = re.match(r"^[+-]?\d+(?:\.\d+)?", value)
+            if match:
+                return float(match.group(0))
+            return float(value)
+
         try:
             parts = line.split(",")
             for part in parts:
                 if ":" in part:
                     k, v = part.split(":", 1)
-                    data[k.strip().upper()] = float(v.strip())
+                    data[k.strip().upper()] = parse_num(v)
         except Exception:
             pass
+
+        # Fallback for lines like:
+        # "Received Telemetry: d=326.0 cm gx=None gy=None gz=None"
+        if not data:
+            try:
+                text = line
+                if ":" in line:
+                    text = line.split(":", 1)[1]
+
+                for k, v in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^,\s]+)", text):
+                    data[k.strip().upper()] = parse_num(v)
+            except Exception:
+                pass
+
         if data:
             self.telemetry.emit(data)
 
@@ -1101,6 +1207,7 @@ class DashboardWindow(QMainWindow):
         self._serial_thread.telemetry.connect(self._on_telemetry)
         self._serial_thread.start()
         self._connected_port = port
+        self.accel.clear_data()
 
         self.status_badge.setText(f"● Connected — {port} @ 115200 baud")
         self.status_badge.setStyleSheet(
@@ -1133,6 +1240,7 @@ class DashboardWindow(QMainWindow):
         )
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
+        self.accel.clear_data()
         self._log("[SERIAL] Disconnected.", color=WARN)
 
     # ── Anchor ────────────────────────────────────────────────────────────────
@@ -1222,9 +1330,7 @@ class DashboardWindow(QMainWindow):
             return
 
         self._anchor_reader = AnchorReader(self._anchor_proc)
-        self._anchor_reader.line_received.connect(
-            lambda l: self._log(f"[ANCHOR] {l}", color=ACCENT)
-        )
+        self._anchor_reader.line_received.connect(self._on_anchor_line)
         self._anchor_reader.finished_sig.connect(self._on_anchor_finished)
         self._anchor_reader.start()
 
@@ -1303,6 +1409,36 @@ class DashboardWindow(QMainWindow):
     def _on_serial_line(self, line):
         self._log(line)
 
+    def _parse_num(self, raw):
+        value = str(raw).strip()
+        if value.upper() in {"NONE", "NULL", "N/A", "NA", "-"}:
+            return None
+        match = re.match(r"^[+-]?\d+(?:\.\d+)?", value)
+        if match:
+            return float(match.group(0))
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _extract_telemetry_from_line(self, line):
+        data = {}
+        text = line.split(":", 1)[1] if ":" in line else line
+        for k, v in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^,\s]+)", text):
+            parsed = self._parse_num(v)
+            if parsed is not None:
+                data[k.strip().upper()] = parsed
+            elif k.strip().upper() in {"GX", "GY", "GZ", "AX", "AY", "AZ"}:
+                # Keep explicit None for accel keys so waiting logic can still apply.
+                data[k.strip().upper()] = None
+        return data
+
+    def _on_anchor_line(self, line):
+        self._log(f"[ANCHOR] {line}", color=ACCENT)
+        data = self._extract_telemetry_from_line(line)
+        if data:
+            self._on_telemetry(data)
+
     def _on_telemetry(self, data):
         self._latest_telemetry.update(data)
 
@@ -1332,12 +1468,27 @@ class DashboardWindow(QMainWindow):
             if self.sig_val_lbl:
                 self.sig_val_lbl.setText(f"{v:.0f} dBm")
 
-        if "AX" in data or "AY" in data or "AZ" in data:
-            self.accel.set_accel(
-                data.get("AX", 0),
-                data.get("AY", 0),
-                data.get("AZ", 9.81),
-            )
+        # Keep Scout unchanged and map gx/gy/gz into existing ax/ay/az display.
+        ax = data.get("AX")
+        ay = data.get("AY")
+        az = data.get("AZ")
+
+        if ax is None and "GX" in data:
+            ax = data.get("GX")
+        if ay is None and "GY" in data:
+            ay = data.get("GY")
+        if az is None:
+            if "GZ" in data and data.get("GZ") is not None:
+                az = data.get("GZ")
+            elif "GY" in data:
+                # Requested mapping fallback: use gy when gz is not available.
+                az = data.get("GY")
+
+        if ax is not None and ay is not None and az is not None:
+            self._latest_telemetry["AX"] = ax
+            self._latest_telemetry["AY"] = ay
+            self._latest_telemetry["AZ"] = az
+            self.accel.set_accel(ax, ay, az)
 
         if self._csv_writer:
             self._write_csv_row()
@@ -1379,7 +1530,6 @@ class DashboardWindow(QMainWindow):
             self.sig_bar.set_value(rssi)
         if self.sig_val_lbl:
             self.sig_val_lbl.setText(f"{rssi:.0f} dBm")
-        self.accel.set_accel(ax, ay, az)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
