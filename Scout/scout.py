@@ -1,4 +1,4 @@
-from machine import Pin, SPI, I2C, time_pulse_us
+from machine import Pin, SPI, I2C, PWM, time_pulse_us
 from nrf24l01 import NRF24L01
 import utime
 import ustruct
@@ -50,6 +50,16 @@ ARM_ON_FIRST_ACK = True
 WAIT_STATUS_MS = 2000
 REQUIRE_ANCHOR_FOR_AUTONOMY = True
 MOTORS_INVERTED = True
+
+# Continuous ultrasonic scan servo
+SERVO_PIN = int(globals().get("SERVO_PIN", 2))
+SERVO_MIN_ANGLE = 30
+SERVO_MAX_ANGLE = 150
+SERVO_STEP_DEG = 18
+SERVO_SETTLE_MS = 25
+SERVO_MIN_US = 600
+SERVO_MAX_US = 2400
+LOOP_SLEEP_MS = 80
 
 
 def init_imu(max_attempts=3):
@@ -124,6 +134,25 @@ def init_imu(max_attempts=3):
     return None
 
 
+def init_servo():
+    try:
+        pwm = PWM(Pin(SERVO_PIN))
+        pwm.freq(50)
+        return pwm
+    except Exception as exc:
+        print("Servo init failed on GP{}: {}".format(SERVO_PIN, exc))
+        return None
+
+
+def set_servo_angle(pwm, angle):
+    if pwm is None:
+        return
+    angle = max(0, min(180, angle))
+    pulse_us = int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * angle / 180)
+    duty_u16 = int(pulse_us * 65535 / 20000)
+    pwm.duty_u16(duty_u16)
+
+
 def read_distance_cm():
     trig.value(0)
     utime.sleep_us(2)
@@ -196,6 +225,7 @@ def init_radio(max_attempts=5):
 
 nrf = init_radio()
 imu = init_imu()
+servo_pwm = init_servo()
 motors = MotorPair(
     a_in1=9,
     a_in2=10,
@@ -244,8 +274,11 @@ anchor_connected = not REQUIRE_ANCHOR_FOR_AUTONOMY
 anchor_ever_connected = not REQUIRE_ANCHOR_FOR_AUTONOMY
 ack_fail_count = 0
 waiting_anchor_next_ms = utime.ticks_ms()
+servo_angle = 90
+servo_dir = 1
 
 motors.stop()
+set_servo_angle(servo_pwm, servo_angle)
 
 
 def _to_i16_cent(value):
@@ -280,72 +313,50 @@ def _run_avoidance(turn_right):
     motors.stop()
     _turn_for_ms(not turn_right, TURN_MS)
 
-while True:
-    distance_now = read_distance_cm()
+try:
+    while True:
+        if servo_pwm is not None:
+            next_angle = servo_angle + servo_dir * SERVO_STEP_DEG
+            if next_angle > SERVO_MAX_ANGLE:
+                next_angle = SERVO_MAX_ANGLE
+                servo_dir = -1
+            elif next_angle < SERVO_MIN_ANGLE:
+                next_angle = SERVO_MIN_ANGLE
+                servo_dir = 1
+            servo_angle = next_angle
+            set_servo_angle(servo_pwm, servo_angle)
+            utime.sleep_ms(SERVO_SETTLE_MS)
 
-    if distance_now is not None:
-        last_distance_cm = distance_now
-        last_distance_ms = utime.ticks_ms()
-        no_echo_count = 0
-        distance_cm = distance_now
-    else:
-        no_echo_count += 1
-        if (
-            last_distance_cm is not None
-            and utime.ticks_diff(utime.ticks_ms(), last_distance_ms) <= DIST_HOLD_MS
-        ):
-            # Keep telemetry stable through short ultrasonic dropouts.
-            distance_cm = last_distance_cm
+        distance_now = read_distance_cm()
+
+        if distance_now is not None:
+            last_distance_cm = distance_now
+            last_distance_ms = utime.ticks_ms()
+            no_echo_count = 0
+            distance_cm = distance_now
         else:
-            distance_cm = None
+            no_echo_count += 1
+            if (
+                last_distance_cm is not None
+                and utime.ticks_diff(utime.ticks_ms(), last_distance_ms) <= DIST_HOLD_MS
+            ):
+                # Keep telemetry stable through short ultrasonic dropouts.
+                distance_cm = last_distance_cm
+            else:
+                distance_cm = None
 
-        if no_echo_count % 8 == 0:
-            print(
-                "HC-SR04 timeout on TRIG=GP{} ECHO=GP{} (check wiring/target range)".format(
-                    TRIG_PIN, ECHO_PIN
+            if no_echo_count % 8 == 0:
+                print(
+                    "HC-SR04 timeout on TRIG=GP{} ECHO=GP{} (check wiring/target range)".format(
+                        TRIG_PIN, ECHO_PIN
+                    )
                 )
-            )
 
-    imu_available = False
+        imu_available = False
 
-    if imu is None:
-        if utime.ticks_diff(utime.ticks_ms(), next_imu_retry_ms) >= 0:
-            imu = init_imu(max_attempts=1)
-            next_imu_retry_ms = utime.ticks_add(utime.ticks_ms(), IMU_RETRY_MS)
-        if utime.ticks_diff(utime.ticks_ms(), last_gyro_ms) <= GYRO_HOLD_MS:
-            gx, gy, gz = last_gx, last_gy, last_gz
-            pitch, roll = last_pitch, last_roll
-            ax, ay, az = last_ax, last_ay, last_az
-            imu_available = True
-        else:
-            gx = gy = gz = None
-            pitch = roll = None
-            ax = ay = az = None
-    else:
-        try:
-            imu_data = imu.read()
-            gx, gy, gz = imu_data["gx"], imu_data["gy"], imu_data["gz"]
-            raw_pitch, raw_roll = imu_data["pitch"], imu_data["roll"]
-            if not imu_zero_captured:
-                pitch_zero = raw_pitch
-                roll_zero = raw_roll
-                imu_zero_captured = True
-                print("IMU zero set: pitch0={:.2f} roll0={:.2f}".format(pitch_zero, roll_zero))
-            pitch = raw_pitch - pitch_zero
-            roll = raw_roll - roll_zero
-            ax, ay, az = imu_data["ax"], imu_data["ay"], imu_data["az"]
-            imu_available = True
-            last_gx, last_gy, last_gz = gx, gy, gz
-            last_pitch, last_roll = pitch, roll
-            last_ax, last_ay, last_az = ax, ay, az
-            last_gyro_ms = utime.ticks_ms()
-            imu_read_fail_count = 0
-        except OSError as exc:
-            imu_read_fail_count += 1
-            print("IMU read failed ({}/{}): {}".format(imu_read_fail_count, IMU_READ_FAIL_REINIT, exc))
-            if imu_read_fail_count >= IMU_READ_FAIL_REINIT:
-                imu = None
-                imu_read_fail_count = 0
+        if imu is None:
+            if utime.ticks_diff(utime.ticks_ms(), next_imu_retry_ms) >= 0:
+                imu = init_imu(max_attempts=1)
                 next_imu_retry_ms = utime.ticks_add(utime.ticks_ms(), IMU_RETRY_MS)
             if utime.ticks_diff(utime.ticks_ms(), last_gyro_ms) <= GYRO_HOLD_MS:
                 gx, gy, gz = last_gx, last_gy, last_gz
@@ -356,65 +367,73 @@ while True:
                 gx = gy = gz = None
                 pitch = roll = None
                 ax = ay = az = None
-
-    if imu_available:
-        gx_i = _to_i16_cent(gx)
-        gy_i = _to_i16_cent(gy)
-        gz_i = _to_i16_cent(gz)
-        pitch_i = _to_i16_cent(pitch)
-        roll_i = _to_i16_cent(roll)
-        ax_i = _to_i16_cent(ax)
-        ay_i = _to_i16_cent(ay)
-        az_i = _to_i16_cent(az)
-    else:
-        gx_i = gy_i = gz_i = GYRO_MISSING_SENTINEL
-        pitch_i = roll_i = GYRO_MISSING_SENTINEL
-        ax_i = ay_i = az_i = GYRO_MISSING_SENTINEL
-    dist_i = 0xFFFF if distance_cm is None else max(0, min(65534, int(distance_cm)))
-
-    # Packet format: b'T' + <Hhhhhhhhh>
-    # distance_cm + gx,gy,gz + pitch,roll + ax,ay,az (all int16 centi-units)
-    payload = b"T" + ustruct.pack(
-        "<Hhhhhhhhh", dist_i, gx_i, gy_i, gz_i, pitch_i, roll_i, ax_i, ay_i, az_i
-    )
-
-    if nrf is None:
-        if gx is None:
-            print(
-                "Telemetry (offline): d={} gx=None gy=None gz=None pitch=None roll=None".format(
-                    "None" if distance_cm is None else "{:.1f}cm".format(distance_cm)
-                )
-            )
         else:
-            print(
-                "Telemetry (offline): d={} gx={:.2f} gy={:.2f} gz={:.2f} pitch={:.2f} roll={:.2f}".format(
-                    "None" if distance_cm is None else "{:.1f}cm".format(distance_cm),
-                    gx,
-                    gy,
-                    gz,
-                    pitch,
-                    roll,
-                )
-            )
-    else:
-        nrf.stop_listening()
-        try:
-            nrf.send(payload)
-            led.toggle()
-            ack_fail_count = 0
-            if not anchor_connected and ARM_ON_FIRST_ACK:
-                anchor_connected = True
-                anchor_ever_connected = True
-                print("Anchor link established. Autonomous mode armed.")
+            try:
+                imu_data = imu.read()
+                gx, gy, gz = imu_data["gx"], imu_data["gy"], imu_data["gz"]
+                raw_pitch, raw_roll = imu_data["pitch"], imu_data["roll"]
+                if not imu_zero_captured:
+                    pitch_zero = raw_pitch
+                    roll_zero = raw_roll
+                    imu_zero_captured = True
+                    print("IMU zero set: pitch0={:.2f} roll0={:.2f}".format(pitch_zero, roll_zero))
+                pitch = raw_pitch - pitch_zero
+                roll = raw_roll - roll_zero
+                ax, ay, az = imu_data["ax"], imu_data["ay"], imu_data["az"]
+                imu_available = True
+                last_gx, last_gy, last_gz = gx, gy, gz
+                last_pitch, last_roll = pitch, roll
+                last_ax, last_ay, last_az = ax, ay, az
+                last_gyro_ms = utime.ticks_ms()
+                imu_read_fail_count = 0
+            except OSError as exc:
+                imu_read_fail_count += 1
+                print("IMU read failed ({}/{}): {}".format(imu_read_fail_count, IMU_READ_FAIL_REINIT, exc))
+                if imu_read_fail_count >= IMU_READ_FAIL_REINIT:
+                    imu = None
+                    imu_read_fail_count = 0
+                    next_imu_retry_ms = utime.ticks_add(utime.ticks_ms(), IMU_RETRY_MS)
+                if utime.ticks_diff(utime.ticks_ms(), last_gyro_ms) <= GYRO_HOLD_MS:
+                    gx, gy, gz = last_gx, last_gy, last_gz
+                    pitch, roll = last_pitch, last_roll
+                    ax, ay, az = last_ax, last_ay, last_az
+                    imu_available = True
+                else:
+                    gx = gy = gz = None
+                    pitch = roll = None
+                    ax = ay = az = None
+
+        if imu_available:
+            gx_i = _to_i16_cent(gx)
+            gy_i = _to_i16_cent(gy)
+            gz_i = _to_i16_cent(gz)
+            pitch_i = _to_i16_cent(pitch)
+            roll_i = _to_i16_cent(roll)
+            ax_i = _to_i16_cent(ax)
+            ay_i = _to_i16_cent(ay)
+            az_i = _to_i16_cent(az)
+        else:
+            gx_i = gy_i = gz_i = GYRO_MISSING_SENTINEL
+            pitch_i = roll_i = GYRO_MISSING_SENTINEL
+            ax_i = ay_i = az_i = GYRO_MISSING_SENTINEL
+        dist_i = 0xFFFF if distance_cm is None else max(0, min(65534, int(distance_cm)))
+
+        # Packet format: b'T' + <Hhhhhhhhh>
+        # distance_cm + gx,gy,gz + pitch,roll + ax,ay,az (all int16 centi-units)
+        payload = b"T" + ustruct.pack(
+            "<Hhhhhhhhh", dist_i, gx_i, gy_i, gz_i, pitch_i, roll_i, ax_i, ay_i, az_i
+        )
+
+        if nrf is None:
             if gx is None:
                 print(
-                    "Sent Telemetry: d={} gx=None gy=None gz=None pitch=None roll=None".format(
+                    "Telemetry (offline): d={} gx=None gy=None gz=None pitch=None roll=None".format(
                         "None" if distance_cm is None else "{:.1f}cm".format(distance_cm)
                     )
                 )
             else:
                 print(
-                    "Sent Telemetry: d={} gx={:.2f} gy={:.2f} gz={:.2f} pitch={:.2f} roll={:.2f}".format(
+                    "Telemetry (offline): d={} gx={:.2f} gy={:.2f} gz={:.2f} pitch={:.2f} roll={:.2f}".format(
                         "None" if distance_cm is None else "{:.1f}cm".format(distance_cm),
                         gx,
                         gy,
@@ -423,49 +442,82 @@ while True:
                         roll,
                     )
                 )
-        except OSError as exc:
-            msg = str(exc)
-            if msg in ("send failed", "timed out"):
-                print("Anchor not responding (packet not acknowledged)")
-                ack_fail_count += 1
-                if REQUIRE_ANCHOR_FOR_AUTONOMY and anchor_connected and ack_fail_count >= ACK_LOSS_FAILS:
-                    print("Anchor link lost. Autonomous mode remains active after first link.")
-            else:
-                print("Radio hardware error; entering offline mode")
-                nrf = None
-                next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
-                if REQUIRE_ANCHOR_FOR_AUTONOMY and anchor_connected:
-                    print("Anchor link lost. Autonomous mode remains active after first link.")
-
-    # background retry if radio was unavailable
-    if nrf is None and utime.ticks_diff(utime.ticks_ms(), next_retry_ms) >= 0:
-        nrf = init_radio(max_attempts=1)
-        if nrf is not None:
-            configure_radio(nrf)
-        next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
-
-    autonomy_enabled = anchor_connected or anchor_ever_connected
-
-    if autonomy_enabled:
-        if distance_cm is not None and distance_cm <= OBSTACLE_CM:
-            turn_right = bool(urandom.getrandbits(1))
-            print(
-                "Obstacle {:.1f}cm detected: stop, turn {}, bypass, return heading".format(
-                    distance_cm,
-                    "RIGHT" if turn_right else "LEFT",
-                )
-            )
-            _run_avoidance(turn_right)
         else:
-            if MOTORS_INVERTED:
-                motors.backward(AUTO_SPEED)
+            nrf.stop_listening()
+            try:
+                nrf.send(payload)
+                led.toggle()
+                ack_fail_count = 0
+                if not anchor_connected and ARM_ON_FIRST_ACK:
+                    anchor_connected = True
+                    anchor_ever_connected = True
+                    print("Anchor link established. Autonomous mode armed.")
+                if gx is None:
+                    print(
+                        "Sent Telemetry: d={} gx=None gy=None gz=None pitch=None roll=None".format(
+                            "None" if distance_cm is None else "{:.1f}cm".format(distance_cm)
+                        )
+                    )
+                else:
+                    print(
+                        "Sent Telemetry: d={} gx={:.2f} gy={:.2f} gz={:.2f} pitch={:.2f} roll={:.2f}".format(
+                            "None" if distance_cm is None else "{:.1f}cm".format(distance_cm),
+                            gx,
+                            gy,
+                            gz,
+                            pitch,
+                            roll,
+                        )
+                    )
+            except OSError as exc:
+                msg = str(exc)
+                if msg in ("send failed", "timed out"):
+                    print("Anchor not responding (packet not acknowledged)")
+                    ack_fail_count += 1
+                    if REQUIRE_ANCHOR_FOR_AUTONOMY and anchor_connected and ack_fail_count >= ACK_LOSS_FAILS:
+                        print("Anchor link lost. Autonomous mode remains active after first link.")
+                else:
+                    print("Radio hardware error; entering offline mode")
+                    nrf = None
+                    next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
+                    if REQUIRE_ANCHOR_FOR_AUTONOMY and anchor_connected:
+                        print("Anchor link lost. Autonomous mode remains active after first link.")
+
+        # background retry if radio was unavailable
+        if nrf is None and utime.ticks_diff(utime.ticks_ms(), next_retry_ms) >= 0:
+            nrf = init_radio(max_attempts=1)
+            if nrf is not None:
+                configure_radio(nrf)
+            next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
+
+        autonomy_enabled = anchor_connected or anchor_ever_connected
+
+        if autonomy_enabled:
+            if distance_cm is not None and distance_cm <= OBSTACLE_CM:
+                turn_right = bool(urandom.getrandbits(1))
+                print(
+                    "Obstacle {:.1f}cm detected: stop, turn {}, bypass, return heading".format(
+                        distance_cm,
+                        "RIGHT" if turn_right else "LEFT",
+                    )
+                )
+                _run_avoidance(turn_right)
             else:
-                motors.forward(AUTO_SPEED)
-    else:
-        motors.stop()
-        now_ms = utime.ticks_ms()
-        if utime.ticks_diff(now_ms, waiting_anchor_next_ms) >= 0:
-            print("Autonomy waiting for first Anchor ACK before moving.")
-            waiting_anchor_next_ms = utime.ticks_add(now_ms, WAIT_STATUS_MS)
-            
-    utime.sleep_ms(250)
+                if MOTORS_INVERTED:
+                    motors.backward(AUTO_SPEED)
+                else:
+                    motors.forward(AUTO_SPEED)
+        else:
+            motors.stop()
+            now_ms = utime.ticks_ms()
+            if utime.ticks_diff(now_ms, waiting_anchor_next_ms) >= 0:
+                print("Autonomy waiting for first Anchor ACK before moving.")
+                waiting_anchor_next_ms = utime.ticks_add(now_ms, WAIT_STATUS_MS)
+
+        utime.sleep_ms(LOOP_SLEEP_MS)
+finally:
+    motors.stop()
+    set_servo_angle(servo_pwm, 90)
+    if servo_pwm is not None:
+        servo_pwm.deinit()
+    print("Scout stopped safely.")
