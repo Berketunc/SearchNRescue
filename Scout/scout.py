@@ -47,7 +47,7 @@ BYPASS_FORWARD_MS = 700
 ACK_LOSS_FAILS = 5
 ARM_ON_FIRST_ACK = True
 WAIT_STATUS_MS = 2000
-REQUIRE_ANCHOR_FOR_AUTONOMY = False
+REQUIRE_ANCHOR_FOR_AUTONOMY = True
 MOTORS_INVERTED = True
 
 
@@ -240,6 +240,7 @@ imu_zero_captured = False
 pitch_zero = 0.0
 roll_zero = 0.0
 anchor_connected = not REQUIRE_ANCHOR_FOR_AUTONOMY
+anchor_ever_connected = not REQUIRE_ANCHOR_FOR_AUTONOMY
 avoid_right_next = True
 ack_fail_count = 0
 waiting_anchor_next_ms = utime.ticks_ms()
@@ -403,6 +404,7 @@ while True:
             ack_fail_count = 0
             if not anchor_connected and ARM_ON_FIRST_ACK:
                 anchor_connected = True
+                anchor_ever_connected = True
                 print("Anchor link established. Autonomous mode armed.")
             if gx is None:
                 print(
@@ -427,17 +429,13 @@ while True:
                 print("Anchor not responding (packet not acknowledged)")
                 ack_fail_count += 1
                 if REQUIRE_ANCHOR_FOR_AUTONOMY and anchor_connected and ack_fail_count >= ACK_LOSS_FAILS:
-                    print("Anchor link lost. Autonomous mode paused.")
-                    anchor_connected = False
-                    motors.stop()
+                    print("Anchor link lost. Autonomous mode remains active after first link.")
             else:
                 print("Radio hardware error; entering offline mode")
                 nrf = None
                 next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
                 if REQUIRE_ANCHOR_FOR_AUTONOMY and anchor_connected:
-                    print("Anchor link lost. Autonomous mode paused.")
-                    anchor_connected = False
-                    motors.stop()
+                    print("Anchor link lost. Autonomous mode remains active after first link.")
 
     # background retry if radio was unavailable
     if nrf is None and utime.ticks_diff(utime.ticks_ms(), next_retry_ms) >= 0:
@@ -446,7 +444,9 @@ while True:
             configure_radio(nrf)
         next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
 
-    if anchor_connected:
+    autonomy_enabled = anchor_connected or anchor_ever_connected
+
+    if autonomy_enabled:
         if distance_cm is not None and distance_cm <= OBSTACLE_CM:
             turn_right = avoid_right_next
             avoid_right_next = not avoid_right_next
@@ -466,7 +466,7 @@ while True:
         motors.stop()
         now_ms = utime.ticks_ms()
         if utime.ticks_diff(now_ms, waiting_anchor_next_ms) >= 0:
-            print("Autonomy waiting for Anchor ACK before moving.")
+            print("Autonomy waiting for first Anchor ACK before moving.")
             waiting_anchor_next_ms = utime.ticks_add(now_ms, WAIT_STATUS_MS)
             
     utime.sleep_ms(250)
