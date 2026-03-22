@@ -3,6 +3,7 @@ from nrf24l01 import NRF24L01
 import utime
 import ustruct
 from control.imu import IMU
+from control.motors import MotorPair
 
 # 1. Setup LED and BMI160
 led = Pin("LED", Pin.OUT)
@@ -37,6 +38,17 @@ IMU_ADDR_CANDIDATES = (0x69, 0x68)
 IMU_FREQ_CANDIDATES = (400_000, 100_000)
 IMU_RETRY_MS = 3000
 RADIO_PAYLOAD_SIZE = 19  # Must match Anchor static payload width for auto-ACK.
+
+# Autonomous driving config
+OBSTACLE_CM = 28.0
+AUTO_SPEED = 22000
+TURN_MS = 450
+BYPASS_FORWARD_MS = 700
+ACK_LOSS_FAILS = 5
+ARM_ON_FIRST_ACK = True
+WAIT_STATUS_MS = 2000
+REQUIRE_ANCHOR_FOR_AUTONOMY = False
+MOTORS_INVERTED = True
 
 
 def init_imu(max_attempts=3):
@@ -183,6 +195,14 @@ def init_radio(max_attempts=5):
 
 nrf = init_radio()
 imu = init_imu()
+motors = MotorPair(
+    a_in1=9,
+    a_in2=10,
+    a_pwm=11,
+    b_in1=6,
+    b_in2=12,
+    b_pwm=13,
+)
 next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
 next_imu_retry_ms = utime.ticks_add(utime.ticks_ms(), IMU_RETRY_MS)
 
@@ -219,6 +239,12 @@ IMU_READ_FAIL_REINIT = 5
 imu_zero_captured = False
 pitch_zero = 0.0
 roll_zero = 0.0
+anchor_connected = not REQUIRE_ANCHOR_FOR_AUTONOMY
+avoid_right_next = True
+ack_fail_count = 0
+waiting_anchor_next_ms = utime.ticks_ms()
+
+motors.stop()
 
 
 def _to_i16_cent(value):
@@ -228,6 +254,30 @@ def _to_i16_cent(value):
     if v < -32768:
         return -32768
     return v
+
+
+def _turn_for_ms(turn_right, duration_ms):
+    if MOTORS_INVERTED:
+        turn_right = not turn_right
+    if turn_right:
+        motors.right_turn(AUTO_SPEED)
+    else:
+        motors.left_turn(AUTO_SPEED)
+    utime.sleep_ms(duration_ms)
+    motors.stop()
+
+
+def _run_avoidance(turn_right):
+    motors.stop()
+    utime.sleep_ms(120)
+    _turn_for_ms(turn_right, TURN_MS)
+    if MOTORS_INVERTED:
+        motors.backward(AUTO_SPEED)
+    else:
+        motors.forward(AUTO_SPEED)
+    utime.sleep_ms(BYPASS_FORWARD_MS)
+    motors.stop()
+    _turn_for_ms(not turn_right, TURN_MS)
 
 while True:
     distance_now = read_distance_cm()
@@ -350,6 +400,10 @@ while True:
         try:
             nrf.send(payload)
             led.toggle()
+            ack_fail_count = 0
+            if not anchor_connected and ARM_ON_FIRST_ACK:
+                anchor_connected = True
+                print("Anchor link established. Autonomous mode armed.")
             if gx is None:
                 print(
                     "Sent Telemetry: d={} gx=None gy=None gz=None pitch=None roll=None".format(
@@ -371,10 +425,19 @@ while True:
             msg = str(exc)
             if msg in ("send failed", "timed out"):
                 print("Anchor not responding (packet not acknowledged)")
+                ack_fail_count += 1
+                if REQUIRE_ANCHOR_FOR_AUTONOMY and anchor_connected and ack_fail_count >= ACK_LOSS_FAILS:
+                    print("Anchor link lost. Autonomous mode paused.")
+                    anchor_connected = False
+                    motors.stop()
             else:
                 print("Radio hardware error; entering offline mode")
                 nrf = None
                 next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
+                if REQUIRE_ANCHOR_FOR_AUTONOMY and anchor_connected:
+                    print("Anchor link lost. Autonomous mode paused.")
+                    anchor_connected = False
+                    motors.stop()
 
     # background retry if radio was unavailable
     if nrf is None and utime.ticks_diff(utime.ticks_ms(), next_retry_ms) >= 0:
@@ -382,5 +445,28 @@ while True:
         if nrf is not None:
             configure_radio(nrf)
         next_retry_ms = utime.ticks_add(utime.ticks_ms(), 5000)
+
+    if anchor_connected:
+        if distance_cm is not None and distance_cm <= OBSTACLE_CM:
+            turn_right = avoid_right_next
+            avoid_right_next = not avoid_right_next
+            print(
+                "Obstacle {:.1f}cm detected: stop, turn {}, bypass, return heading".format(
+                    distance_cm,
+                    "RIGHT" if turn_right else "LEFT",
+                )
+            )
+            _run_avoidance(turn_right)
+        else:
+            if MOTORS_INVERTED:
+                motors.backward(AUTO_SPEED)
+            else:
+                motors.forward(AUTO_SPEED)
+    else:
+        motors.stop()
+        now_ms = utime.ticks_ms()
+        if utime.ticks_diff(now_ms, waiting_anchor_next_ms) >= 0:
+            print("Autonomy waiting for Anchor ACK before moving.")
+            waiting_anchor_next_ms = utime.ticks_add(now_ms, WAIT_STATUS_MS)
             
     utime.sleep_ms(250)
