@@ -1207,22 +1207,18 @@ class DashboardWindow(QMainWindow):
                 env=env,
             )
             
-            # Restart telemetry after spawning mpremote
+            # Keep telemetry paused while Anchor is running (mpremote holds the port)
+            # Telemetry will restart when Anchor stops
+        except Exception as e:
+            self._log(f"[ERROR] Could not launch Anchor.py: {e}", color=DANGER)
+            # Restart telemetry on error if it was running
             if was_serial_running:
                 time.sleep(0.5)
                 self._serial_thread = SerialReaderThread(self._connected_port, 115200)
                 self._serial_thread.line_received.connect(self._on_serial_line)
                 self._serial_thread.telemetry.connect(self._on_telemetry)
                 self._serial_thread.start()
-                self._log("[ANCHOR] Telemetry resumed.", color=ACCENT2)
-        except Exception as e:
-            self._log(f"[ERROR] Could not launch Anchor.py: {e}", color=DANGER)
-            # Ensure telemetry restarts even on error
-            if was_serial_running and not self._serial_thread.isRunning():
-                self._serial_thread = SerialReaderThread(self._connected_port, 115200)
-                self._serial_thread.line_received.connect(self._on_serial_line)
-                self._serial_thread.telemetry.connect(self._on_telemetry)
-                self._serial_thread.start()
+                self._log("[ANCHOR] Telemetry resumed after error.", color=ACCENT2)
             return
 
         self._anchor_reader = AnchorReader(self._anchor_proc)
@@ -1251,12 +1247,30 @@ class DashboardWindow(QMainWindow):
         self._anchor_running = False
         self._update_anchor_btn(running=False)
         self._log("[ANCHOR] Anchor.py stopped.", color=WARN)
+        
+        # Restart telemetry after Anchor stops
+        time.sleep(0.5)  # Give OS time to release the port
+        if self._connected_port:
+            self._serial_thread = SerialReaderThread(self._connected_port, 115200)
+            self._serial_thread.line_received.connect(self._on_serial_line)
+            self._serial_thread.telemetry.connect(self._on_telemetry)
+            self._serial_thread.start()
+            self._log("[ANCHOR] Telemetry resumed.", color=ACCENT2)
 
     def _on_anchor_finished(self):
         self._anchor_running = False
         self._anchor_proc    = None
         self._update_anchor_btn(running=False)
         self._log("[ANCHOR] Anchor.py process exited.", color=WARN)
+        
+        # Restart telemetry after Anchor stops
+        time.sleep(0.5)  # Give OS time to release the port
+        if self._connected_port:
+            self._serial_thread = SerialReaderThread(self._connected_port, 115200)
+            self._serial_thread.line_received.connect(self._on_serial_line)
+            self._serial_thread.telemetry.connect(self._on_telemetry)
+            self._serial_thread.start()
+            self._log("[ANCHOR] Telemetry resumed.", color=ACCENT2)
 
     def _update_anchor_btn(self, running):
         if not hasattr(self, "anchor_btn"):
