@@ -2,6 +2,7 @@ from machine import Pin, SPI, I2C, time_pulse_us
 from nrf24l01 import NRF24L01
 import utime
 import ustruct
+import urandom
 from control.imu import IMU
 from control.motors import MotorPair
 
@@ -241,7 +242,6 @@ pitch_zero = 0.0
 roll_zero = 0.0
 anchor_connected = not REQUIRE_ANCHOR_FOR_AUTONOMY
 anchor_ever_connected = not REQUIRE_ANCHOR_FOR_AUTONOMY
-avoid_right_next = True
 ack_fail_count = 0
 waiting_anchor_next_ms = utime.ticks_ms()
 
@@ -448,8 +448,7 @@ while True:
 
     if autonomy_enabled:
         if distance_cm is not None and distance_cm <= OBSTACLE_CM:
-            turn_right = avoid_right_next
-            avoid_right_next = not avoid_right_next
+            turn_right = bool(urandom.getrandbits(1))
             print(
                 "Obstacle {:.1f}cm detected: stop, turn {}, bypass, return heading".format(
                     distance_cm,
