@@ -248,32 +248,119 @@ class RadarNodeMap(QWidget):
     def __init__(self):
         super().__init__()
         self.sweep_angle = 0.0
+        self._sweep_dir = 1
+        self._input_phase = 1
+        self._last_input_angle = None
+        self._sweep_timer_ms = 30
+        self._sweep_step_deg = 2.0
+        self.max_distance_cm = 200.0
+        self.alert_distance_cm = 40.0
         self.nodes = []       # list of (angle_deg, distance_fraction, label)
-        self.blips = []       # [(x_frac, y_frac, age)]  age 0→1
+        self.blips = []       # [(x_frac, y_frac, age, is_alert)]
         self.setMinimumSize(160, 160)
 
         self._sweep_timer = QTimer(self)
         self._sweep_timer.timeout.connect(self._advance_sweep)
-        self._sweep_timer.start(30)
+        self._sweep_timer.start(self._sweep_timer_ms)
+
+    def set_sweep_speed(self, deg_per_sec):
+        """Set visual sweep speed in degrees/second for 0..180 ping-pong scan."""
+        speed = max(1.0, float(deg_per_sec))
+        self._sweep_step_deg = speed * (self._sweep_timer_ms / 1000.0)
+
+    def set_sweep_timing(self, timer_ms):
+        """Adjust timer period while preserving current degrees/second."""
+        timer_ms = max(10, int(timer_ms))
+        current_speed = self._sweep_step_deg / (self._sweep_timer_ms / 1000.0)
+        self._sweep_timer_ms = timer_ms
+        self._sweep_timer.start(self._sweep_timer_ms)
+        self._sweep_step_deg = current_speed * (self._sweep_timer_ms / 1000.0)
 
     def _advance_sweep(self):
-        self.sweep_angle = (self.sweep_angle + 2) % 360
+        self.sweep_angle += self._sweep_step_deg * self._sweep_dir
+        if self.sweep_angle >= 180:
+            self.sweep_angle = 180
+            self._sweep_dir = -1
+        elif self.sweep_angle <= 0:
+            self.sweep_angle = 0
+            self._sweep_dir = 1
+
         # age blips
-        self.blips = [(x, y, a + 0.01) for x, y, a in self.blips if a < 1.0]
+        self.blips = [(x, y, a + 0.01, alert) for x, y, a, alert in self.blips if a < 1.0]
         # generate new blip for each node near sweep
-        for ang, dist, label in self.nodes:
-            if abs((self.sweep_angle - ang) % 360) < 3:
-                rad = math.radians(ang - 90)
+        for node in self.nodes:
+            if len(node) >= 4:
+                ang, dist, label, is_alert = node
+            else:
+                ang, dist, label = node
+                is_alert = False
+
+            # Keep the center intentionally empty for future overlays.
+            if dist <= 0.05:
+                continue
+            if abs(self.sweep_angle - ang) < 3:
+                # 0..180 radar: 0=right, 90=top, 180=left.
+                rad = math.radians(ang)
                 fx = 0.5 + dist * math.cos(rad) * 0.5
-                fy = 0.5 + dist * math.sin(rad) * 0.5
+                fy = 0.5 - dist * math.sin(rad) * 0.5
                 # avoid duplicates
                 if not any(abs(x - fx) < 0.02 and abs(y - fy) < 0.02
-                           for x, y, _ in self.blips):
-                    self.blips.append((fx, fy, 0.0))
+                           for x, y, _, _ in self.blips):
+                    self.blips.append((fx, fy, 0.0, is_alert))
         self.update()
 
     def set_nodes(self, nodes):
-        self.nodes = nodes
+        # Keep center clear and constrain to 0..180 sweep sector.
+        filtered = []
+        for node in nodes:
+            if len(node) >= 4:
+                ang, dist, label, is_alert = node
+            else:
+                ang, dist, label = node
+                is_alert = False
+
+            if dist <= 0.05:
+                continue
+            if 0 <= ang <= 180:
+                filtered.append((ang, dist, label, is_alert))
+        self.nodes = filtered
+        self.update()
+
+    def register_detection(self, distance_cm, angle_deg=None):
+        """Register a distance sample. If angle is omitted, current sweep angle is used."""
+        if distance_cm is None:
+            return
+
+        if angle_deg is not None:
+            try:
+                raw = max(0.0, min(180.0, float(angle_deg)))
+
+                # If sender provides sawtooth angle (0->180 then reset to 0),
+                # convert it to ping-pong display to avoid jumpy restarts.
+                if self._last_input_angle is not None:
+                    if self._input_phase > 0 and raw < self._last_input_angle - 90:
+                        self._input_phase = -1
+                    elif self._input_phase < 0 and raw > self._last_input_angle + 90:
+                        self._input_phase = 1
+
+                angle = raw if self._input_phase > 0 else (180.0 - raw)
+
+                self._sweep_dir = 1 if angle >= self.sweep_angle else -1
+                self.sweep_angle = angle
+                self._last_input_angle = raw
+            except Exception:
+                pass
+
+        d = max(0.0, float(distance_cm))
+        dist_frac = min(1.0, d / max(self.max_distance_cm, 1e-3))
+        if dist_frac <= 0.05:
+            return
+
+        is_alert = d < self.alert_distance_cm
+        rad = math.radians(self.sweep_angle)
+        fx = 0.5 + dist_frac * math.cos(rad) * 0.5
+        fy = 0.5 - dist_frac * math.sin(rad) * 0.5
+        self.blips.append((fx, fy, 0.0, is_alert))
         self.update()
 
     def paintEvent(self, _):
@@ -283,8 +370,11 @@ class RadarNodeMap(QWidget):
         r = min(w, h) / 2 - 6
         cx, cy = w / 2, h / 2
 
+        # 0..180 radar sector (upper semicircle).
         clip = QPainterPath()
-        clip.addEllipse(QPointF(cx, cy), r, r)
+        clip.moveTo(cx - r, cy)
+        clip.arcTo(QRectF(cx - r, cy - r, 2 * r, 2 * r), 180, -180)
+        clip.closeSubpath()
         p.setClipPath(clip)
 
         # background
@@ -298,15 +388,59 @@ class RadarNodeMap(QWidget):
             frac = i / 4
             ring_col = QColor(0, 180, 60, 60)
             p.setPen(QPen(ring_col, 0.8))
-            p.drawEllipse(QPointF(cx, cy), r * frac, r * frac)
+            rr = r * frac
+            p.drawArc(
+                QRectF(cx - rr, cy - rr, 2 * rr, 2 * rr),
+                180 * 16,
+                -180 * 16,
+            )
 
-        # crosshairs
+        # 0..180 angle ticks + numeric labels
+        p.setPen(QPen(QColor(0, 190, 70, 120), 1))
+        for ang in range(0, 181, 10):
+            rad = math.radians(ang)
+            major = (ang % 30 == 0)
+            t_len = 10 if major else 5
+            x1 = cx + (r - t_len) * math.cos(rad)
+            y1 = cy - (r - t_len) * math.sin(rad)
+            x2 = cx + r * math.cos(rad)
+            y2 = cy - r * math.sin(rad)
+            p.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+            if major:
+                p.setFont(QFont(MONO, 7, QFont.Weight.Bold))
+                p.setPen(QPen(qc(ACCENT), 1))
+                lx = cx + (r - 18) * math.cos(rad)
+                ly = cy - (r - 18) * math.sin(rad)
+                p.drawText(
+                    QRectF(lx - 12, ly - 8, 24, 12),
+                    Qt.AlignmentFlag.AlignCenter,
+                    str(ang),
+                )
+                p.setPen(QPen(QColor(0, 190, 70, 120), 1))
+
+        # crosshairs with center gap (reserved for future center content)
         p.setPen(QPen(QColor(0, 180, 60, 60), 0.8))
-        p.drawLine(int(cx - r), int(cy), int(cx + r), int(cy))
-        p.drawLine(int(cx), int(cy - r), int(cx), int(cy + r))
+        center_gap = 10
+        p.drawLine(int(cx - r), int(cy), int(cx - center_gap), int(cy))
+        p.drawLine(int(cx + center_gap), int(cy), int(cx + r), int(cy))
+        p.drawLine(int(cx), int(cy - r), int(cx), int(cy - center_gap))
+
+        # Reserved center zone placeholder (left empty for future overlay).
+        p.setPen(QPen(QColor(0, 180, 60, 140), 1, Qt.PenStyle.DashLine))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        zone_r = max(10, int(r * 0.12))
+        p.drawEllipse(QPointF(cx, cy), zone_r, zone_r)
+        p.setPen(QPen(qc(TEXT_DIM), 1))
+        p.setFont(QFont(MONO, 7))
+        p.drawText(
+            QRectF(cx - 38, cy - zone_r - 14, 76, 12),
+            Qt.AlignmentFlag.AlignCenter,
+            "RESERVED",
+        )
 
         # sweep gradient
-        sweep_rad = math.radians(self.sweep_angle - 90)
+        sweep_rad = math.radians(self.sweep_angle)
         for arc_offset in range(60, 0, -1):
             alpha = int(120 * (1 - arc_offset / 60))
             arc_col = QColor(0, 242, 100, alpha)
@@ -314,15 +448,26 @@ class RadarNodeMap(QWidget):
             p.setBrush(QBrush(arc_col))
             path = QPainterPath()
             path.moveTo(cx, cy)
-            start_angle = -(self.sweep_angle - arc_offset)
+            if self._sweep_dir > 0:
+                seg_start = max(0, min(180, self.sweep_angle - arc_offset))
+                seg_end = max(0, min(180, self.sweep_angle))
+            else:
+                seg_start = max(0, min(180, self.sweep_angle))
+                seg_end = max(0, min(180, self.sweep_angle + arc_offset))
+            seg_span = seg_end - seg_start
+            if seg_span <= 0:
+                continue
+            # Start from the head and sweep backward so trail follows motion
+            # in both directions without visual jump at the ends.
+            start_angle = seg_end
             path.arcTo(QRectF(cx - r, cy - r, 2*r, 2*r),
-                       start_angle, -1)
+                       start_angle, -seg_span)
             path.closeSubpath()
             p.drawPath(path)
 
         # sweep line
         ex = cx + r * math.cos(sweep_rad)
-        ey = cy + r * math.sin(sweep_rad)
+        ey = cy - r * math.sin(sweep_rad)
         sweep_pen = QPen(qc(ACCENT2), 2)
         sweep_pen.setCosmetic(True)
         p.setPen(sweep_pen)
@@ -330,21 +475,27 @@ class RadarNodeMap(QWidget):
 
         # blips
         p.setClipping(False)
-        for bx, by, age in self.blips:
+        for bx, by, age, is_alert in self.blips:
+            if by > 0.5:
+                continue
             alpha = int(255 * (1 - age))
             size  = 6 * (1 - age * 0.5)
-            blip_col = QColor(0, 255, 120, alpha)
+            if is_alert:
+                blip_col = QColor(255, 56, 96, alpha)
+            else:
+                blip_col = QColor(0, 255, 120, alpha)
             p.setBrush(QBrush(blip_col))
             p.setPen(Qt.PenStyle.NoPen)
             px = cx + (bx - 0.5) * 2 * r
             py = cy + (by - 0.5) * 2 * r
             p.drawEllipse(QPointF(px, py), size, size)
 
-        # bezel
+        # bezel (top semicircle)
         p.setClipping(False)
         p.setPen(QPen(qc(BORDER), 3))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(cx, cy), r, r)
+        p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), 180 * 16, -180 * 16)
+        p.drawLine(int(cx - r), int(cy), int(cx + r), int(cy))
 
 
 class BarGraph(QWidget):
@@ -794,7 +945,12 @@ class DashboardWindow(QMainWindow):
         self._csv_file       = None
         self._csv_writer     = None
         self._csv_path       = None
+        self._csv_rows_written = 0
         self._latest_telemetry = {
+            "D": None,
+            "GX": None,
+            "GY": None,
+            "GZ": None,
             "PITCH": 0.0,
             "ROLL": 0.0,
             "HEADING": 0.0,
@@ -928,14 +1084,14 @@ class DashboardWindow(QMainWindow):
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(12, 0, 12, 0)
 
-        lbl = QLabel("LIVE SENSOR NODES · CLICK A CARD TO VIEW ITS INSTRUMENTS")
+        lbl = QLabel("LIVE SENSORS")
         lbl.setFont(QFont(MONO, 9))
         lbl.setStyleSheet(f"color: {TEXT_DIM}; letter-spacing: 2px;")
         layout.addWidget(lbl)
         layout.addStretch()
 
         self.node_placeholder = QLabel(
-            "Waiting for sensor data…  connect a serial port to begin.")
+            "")
         self.node_placeholder.setFont(QFont(MONO, 9))
         self.node_placeholder.setStyleSheet(f"color: {TEXT_DIM};")
         layout.addWidget(self.node_placeholder)
@@ -956,7 +1112,7 @@ class DashboardWindow(QMainWindow):
         layout.setSpacing(6)
 
         # section label
-        sec_lbl = QLabel("AHRS · COMPASS · RADAR · ACCELEROMETER")
+        sec_lbl = QLabel("AHRS · RADAR · ACCELEROMETER")
         sec_lbl.setFont(QFont(MONO, 8))
         sec_lbl.setStyleSheet(f"color: {TEXT_DIM}; letter-spacing: 2px;")
         layout.addWidget(sec_lbl)
@@ -975,30 +1131,15 @@ class DashboardWindow(QMainWindow):
         self.roll_lbl  = ah_card.findChild(QLabel, "roll_lbl")
         row.addWidget(ah_card, 2)
 
-        # Compass
-        self.compass = CompassHSI()
-        cmp_card = make_card(
-            "Compass · HSI",
-            self.compass,
-            [("Heading / Yaw", "hdg_lbl")]
-        )
-        self.hdg_lbl = cmp_card.findChild(QLabel, "hdg_lbl")
-        if self.hdg_lbl:
-            self.hdg_lbl.setText("000°")
-            self.hdg_lbl.setStyleSheet(f"color: {ACCENT};")
-        row.addWidget(cmp_card, 2)
+        # Compass card removed for now.
+        self.compass = None
+        self.hdg_lbl = None
 
         # Radar
         self.radar = RadarNodeMap()
-        rdr_card = make_card(
-            "Radar · Node Map",
-            self.radar,
-            [("Nodes Detected", "nodes_lbl")]
-        )
-        self.nodes_lbl = rdr_card.findChild(QLabel, "nodes_lbl")
-        if self.nodes_lbl:
-            self.nodes_lbl.setText("0")
-            self.nodes_lbl.setStyleSheet(f"color: {ACCENT};")
+        self.radar.set_sweep_speed(90.0)
+        rdr_card = make_card("Radar · Node Map", self.radar)
+        self.nodes_lbl = None
         row.addWidget(rdr_card, 2)
 
         # Right column: altitude + accel
@@ -1126,6 +1267,10 @@ class DashboardWindow(QMainWindow):
             self._csv_writer = csv.writer(self._csv_file)
             self._csv_writer.writerow([
                 "timestamp",
+                "distance_cm",
+                "gx",
+                "gy",
+                "gz",
                 "pitch",
                 "roll",
                 "heading",
@@ -1136,6 +1281,7 @@ class DashboardWindow(QMainWindow):
                 "rssi",
             ])
             self._csv_file.flush()
+            self._csv_rows_written = 0
             self._log("Logging data...", color=ACCENT2)
             self._log(f"[CSV] {os.path.basename(self._csv_path)}", color=TEXT_DIM)
         except Exception as e:
@@ -1159,7 +1305,7 @@ class DashboardWindow(QMainWindow):
         self._csv_path = None
 
         if log_message:
-            self._log("[CSV] Logging stopped.", color=WARN)
+            self._log(f"[CSV] Logging stopped. Rows written: {self._csv_rows_written}", color=WARN)
 
     def _write_csv_row(self):
         if not self._csv_writer:
@@ -1168,6 +1314,10 @@ class DashboardWindow(QMainWindow):
             now = datetime.now().isoformat(timespec="milliseconds")
             self._csv_writer.writerow([
                 now,
+                self._latest_telemetry.get("D"),
+                self._latest_telemetry.get("GX"),
+                self._latest_telemetry.get("GY"),
+                self._latest_telemetry.get("GZ"),
                 self._latest_telemetry["PITCH"],
                 self._latest_telemetry["ROLL"],
                 self._latest_telemetry["HEADING"],
@@ -1178,6 +1328,7 @@ class DashboardWindow(QMainWindow):
                 self._latest_telemetry["RSSI"],
             ])
             self._csv_file.flush()
+            self._csv_rows_written += 1
         except Exception as e:
             self._log(f"[CSV ERROR] {e}", color=DANGER)
             self.log_csv_btn.blockSignals(True)
@@ -1461,6 +1612,26 @@ class DashboardWindow(QMainWindow):
     def _on_telemetry(self, data):
         self._latest_telemetry.update(data)
 
+        for key in ("GX", "GY", "GZ"):
+            if key in data:
+                self._latest_telemetry[key] = data.get(key)
+
+        # Radar distance feed: supports d=..., distance=..., dist=...
+        distance_cm = None
+        for key in ("D", "DISTANCE", "DIST"):
+            if key in data and data.get(key) is not None:
+                distance_cm = data.get(key)
+                break
+
+        if distance_cm is not None:
+            self._latest_telemetry["D"] = distance_cm
+            scan_angle = None
+            for key in ("ANGLE", "SERVO", "THETA"):
+                if key in data and data.get(key) is not None:
+                    scan_angle = data.get(key)
+                    break
+            self.radar.register_detection(distance_cm, angle_deg=scan_angle)
+
         pitch = data.get("PITCH")
         if pitch is None and "PICH" in data:
             # Accept typo alias from upstream sender if present.
@@ -1473,7 +1644,7 @@ class DashboardWindow(QMainWindow):
             self.horizon.set_attitude(pitch, roll)
             self._update_attitude_labels(pitch, roll)
 
-        if "HEADING" in data:
+        if "HEADING" in data and self.compass:
             h = data["HEADING"]
             self.compass.set_heading(h)
             if self.hdg_lbl:
@@ -1535,7 +1706,8 @@ class DashboardWindow(QMainWindow):
         az      = 9.81 + 0.2 * math.sin(t * 2)
 
         # Keep horizon in data-driven mode (no synthetic values).
-        self.compass.set_heading(heading)
+        if self.compass:
+            self.compass.set_heading(heading)
         if self.hdg_lbl:
             self.hdg_lbl.setText(f"{int(heading):03d}°")
         if self.alt_bar:
