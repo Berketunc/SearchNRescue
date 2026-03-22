@@ -38,10 +38,8 @@ _GYR_RANGE_250  = 0x03          # ±250 °/s → 131.2 LSB/°/s
 
 _ACC_SCALE      = 9.80665 / 16384.0   # → m/s²
 _GYR_SCALE      = 1.0 / 131.2         # → °/s
-
-# Complementary filter coefficient (0.98 = trust gyro 98 %, accel 2 %)
-_ALPHA          = 0.98
-
+_PITCH_SIGN     = -1.0
+_ROLL_SIGN      = -1.0
 
 def _s16(high: int, low: int) -> int:
     """Combine two bytes into a signed 16-bit integer."""
@@ -73,9 +71,6 @@ class IMU:
     ):
         self._i2c   = I2C(i2c_id, sda=Pin(sda_pin), scl=Pin(scl_pin), freq=freq)
         self._addr  = addr
-        self._pitch = 0.0
-        self._roll  = 0.0
-        self._t_us  = utime.ticks_us()
         self._init_sensor()
 
     # ── Init ──────────────────────────────────────────────────
@@ -121,40 +116,31 @@ class IMU:
         az = _s16(buf[11], buf[10]) * _ACC_SCALE
         return gx, gy, gz, ax, ay, az
 
-    # ── Complementary filter ──────────────────────────────────
+    # ── Orientation (matches Test/bmi160_test.py) ─────────────
 
     def update(self) -> dict:
         """
-        Read sensor, update complementary filter, return state dict.
+        Read sensor and return state dict.
 
         Keys
         ----
         gx, gy, gz      : gyroscope  °/s
         ax, ay, az      : accelerometer m/s²
-        pitch, roll     : filtered angles in degrees
+        pitch, roll     : accelerometer-only angles in degrees
         heading_change  : yaw rate °/s (gz) — no magnetometer, so
                           relative only; good for turn detection
         """
-        now   = utime.ticks_us()
-        dt    = utime.ticks_diff(now, self._t_us) / 1_000_000.0
-        self._t_us = now
-
         gx, gy, gz, ax, ay, az = self._raw()
 
-        # Accel-only pitch/roll (noisy but absolute)
-        acc_pitch = math.atan2(ay, math.sqrt(ax*ax + az*az)) * 57.2958
-        acc_roll  = math.atan2(-ax, az) * 57.2958
-
-        # Complementary filter: blend gyro integration with accel estimate
-        if dt > 0:
-            self._pitch = _ALPHA * (self._pitch + gy * dt) + (1 - _ALPHA) * acc_pitch
-            self._roll  = _ALPHA * (self._roll  + gx * dt) + (1 - _ALPHA) * acc_roll
+        # Same formulas as Test/bmi160_test.py pitch_roll().
+        pitch = _PITCH_SIGN * math.degrees(math.atan2(ax, math.sqrt(ay * ay + az * az)))
+        roll = _ROLL_SIGN * math.degrees(math.atan2(-ay, az))
 
         return {
             "gx": round(gx, 2), "gy": round(gy, 2), "gz": round(gz, 2),
             "ax": round(ax, 2), "ay": round(ay, 2), "az": round(az, 2),
-            "pitch": round(self._pitch, 1),
-            "roll":  round(self._roll,  1),
+            "pitch": round(pitch, 1),
+            "roll":  round(roll,  1),
             "heading_change": round(gz, 2),
         }
 
@@ -171,7 +157,8 @@ class IMU:
 
     def is_tilted(self, threshold_deg: float = 30.0) -> bool:
         """True when pitch or roll exceed threshold — robot may be stuck/tipped."""
-        return abs(self._pitch) > threshold_deg or abs(self._roll) > threshold_deg
+        data = self.update()
+        return abs(data["pitch"]) > threshold_deg or abs(data["roll"]) > threshold_deg
 
     def heading_rate(self) -> float:
         """Latest yaw rate in °/s (gz). Positive = turning right."""

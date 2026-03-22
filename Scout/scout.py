@@ -9,6 +9,7 @@ led = Pin("LED", Pin.OUT)
 
 # HC-SR04 distance sensor
 ULTRA_PIN_CANDIDATES = [
+    (1, 0),  # user wiring: TRIG=GP1, ECHO=GP0
     (6, 7),  # original sensor_test.py mapping
     (3, 2),  # mapping used in older Scout revisions
     (2, 3),
@@ -23,68 +24,90 @@ echo = Pin(ECHO_PIN, Pin.IN)
 trig.value(0)
 utime.sleep_ms(2)
 
-# BMI160 (user-confirmed wiring)
-IMU_I2C_ID = 0
-IMU_SDA_PIN = 4
-IMU_SCL_PIN = 5
+# BMI160
+# Try common RP2040 I2C pin mappings in priority order.
+# Format: (i2c_id, sda_pin, scl_pin)
+IMU_I2C_CANDIDATES = (
+    (0, 4, 5),
+    (1, 2, 3),
+    (1, 6, 7),
+)
 IMU_ADDR = None  # None = auto-detect, else force 0x68 or 0x69
 IMU_ADDR_CANDIDATES = (0x69, 0x68)
 IMU_FREQ_CANDIDATES = (400_000, 100_000)
 IMU_RETRY_MS = 3000
+RADIO_PAYLOAD_SIZE = 19  # Must match Anchor static payload width for auto-ACK.
 
 
 def init_imu(max_attempts=3):
     addrs = [IMU_ADDR] if IMU_ADDR is not None else list(IMU_ADDR_CANDIDATES)
 
     for attempt in range(1, max_attempts + 1):
-        for freq in IMU_FREQ_CANDIDATES:
-            try:
-                i2c = I2C(IMU_I2C_ID, sda=Pin(IMU_SDA_PIN), scl=Pin(IMU_SCL_PIN), freq=freq)
-                found = i2c.scan()
-            except OSError as exc:
-                if attempt == max_attempts:
-                    print("IMU I2C scan failed at {} Hz: {}".format(freq, exc))
-                utime.sleep_ms(100)
-                continue
-
-            if attempt == 1:
-                print("IMU scan @{}Hz: {}".format(freq, [hex(a) for a in found]))
-
-            for addr in addrs:
-                if addr not in found:
-                    continue
+        for i2c_id, sda_pin, scl_pin in IMU_I2C_CANDIDATES:
+            for freq in IMU_FREQ_CANDIDATES:
                 try:
-                    chip_id = i2c.readfrom_mem(addr, 0x00, 1)[0]
-                except OSError:
-                    continue
-                if chip_id != 0xD1:
-                    continue
-
-                try:
-                    imu = IMU(
-                        i2c_id=IMU_I2C_ID,
-                        sda_pin=IMU_SDA_PIN,
-                        scl_pin=IMU_SCL_PIN,
-                        freq=freq,
-                        addr=addr,
-                    )
-                    print(
-                        "BMI160 ready on I2C{} SDA=GP{} SCL=GP{} addr=0x{:02X} @{}Hz".format(
-                            IMU_I2C_ID, IMU_SDA_PIN, IMU_SCL_PIN, addr, freq
-                        )
-                    )
-                    return imu
+                    i2c = I2C(i2c_id, sda=Pin(sda_pin), scl=Pin(scl_pin), freq=freq)
+                    found = i2c.scan()
                 except OSError as exc:
                     if attempt == max_attempts:
                         print(
-                            "IMU init failed at addr 0x{:02X} @{}Hz ({}/{}): {}".format(
-                                addr, freq, attempt, max_attempts, exc
+                            "IMU I2C scan failed on I2C{} GP{}/GP{} @{}Hz: {}".format(
+                                i2c_id, sda_pin, scl_pin, freq, exc
                             )
                         )
+                    utime.sleep_ms(60)
+                    continue
 
-            utime.sleep_ms(150)
+                if attempt == 1:
+                    print(
+                        "IMU scan I2C{} GP{}/GP{} @{}Hz: {}".format(
+                            i2c_id, sda_pin, scl_pin, freq, [hex(a) for a in found]
+                        )
+                    )
+
+                for addr in addrs:
+                    if addr not in found:
+                        continue
+                    try:
+                        chip_id = i2c.readfrom_mem(addr, 0x00, 1)[0]
+                    except OSError:
+                        continue
+                    if chip_id != 0xD1:
+                        continue
+
+                    try:
+                        imu = IMU(
+                            i2c_id=i2c_id,
+                            sda_pin=sda_pin,
+                            scl_pin=scl_pin,
+                            freq=freq,
+                            addr=addr,
+                        )
+                        print(
+                            "BMI160 ready on I2C{} SDA=GP{} SCL=GP{} addr=0x{:02X} @{}Hz".format(
+                                i2c_id, sda_pin, scl_pin, addr, freq
+                            )
+                        )
+                        return imu
+                    except OSError as exc:
+                        if attempt == max_attempts:
+                            print(
+                                "IMU init failed on I2C{} GP{}/GP{} addr 0x{:02X} @{}Hz ({}/{}): {}".format(
+                                    i2c_id,
+                                    sda_pin,
+                                    scl_pin,
+                                    addr,
+                                    freq,
+                                    attempt,
+                                    max_attempts,
+                                    exc,
+                                )
+                            )
+
+                utime.sleep_ms(80)
 
     print("BMI160 unavailable. Gyro telemetry paused.")
+    print("BMI160 I2C wiring check: CS/CSB must be tied to 3.3V (not GND), SAO/SDO to GND=0x68 or 3.3V=0x69.")
     return None
 
 
@@ -144,7 +167,7 @@ def init_radio(max_attempts=5):
                 spi,
                 Pin(cfg["csn"]),
                 Pin(cfg["ce"]),
-                payload_size=16,
+                payload_size=RADIO_PAYLOAD_SIZE,
                 spi_baudrate=1_000_000,
                 startup_delay_ms=120,
             )
@@ -184,10 +207,27 @@ no_echo_count = 0
 last_gx = 0.0
 last_gy = 0.0
 last_gz = 0.0
+last_pitch = 0.0
+last_roll = 0.0
+last_ax = 0.0
+last_ay = 0.0
+last_az = 0.0
 last_gyro_ms = utime.ticks_add(utime.ticks_ms(), -5000)
 GYRO_HOLD_MS = 2000
 imu_read_fail_count = 0
 IMU_READ_FAIL_REINIT = 5
+imu_zero_captured = False
+pitch_zero = 0.0
+roll_zero = 0.0
+
+
+def _to_i16_cent(value):
+    v = int(value * 100)
+    if v > 32767:
+        return 32767
+    if v < -32768:
+        return -32768
+    return v
 
 while True:
     distance_now = read_distance_cm()
@@ -215,7 +255,7 @@ while True:
                 )
             )
 
-    gyro_available = False
+    imu_available = False
 
     if imu is None:
         if utime.ticks_diff(utime.ticks_ms(), next_imu_retry_ms) >= 0:
@@ -223,14 +263,30 @@ while True:
             next_imu_retry_ms = utime.ticks_add(utime.ticks_ms(), IMU_RETRY_MS)
         if utime.ticks_diff(utime.ticks_ms(), last_gyro_ms) <= GYRO_HOLD_MS:
             gx, gy, gz = last_gx, last_gy, last_gz
-            gyro_available = True
+            pitch, roll = last_pitch, last_roll
+            ax, ay, az = last_ax, last_ay, last_az
+            imu_available = True
         else:
             gx = gy = gz = None
+            pitch = roll = None
+            ax = ay = az = None
     else:
         try:
-            gx, gy, gz = imu.read_gyro()
-            gyro_available = True
+            imu_data = imu.read()
+            gx, gy, gz = imu_data["gx"], imu_data["gy"], imu_data["gz"]
+            raw_pitch, raw_roll = imu_data["pitch"], imu_data["roll"]
+            if not imu_zero_captured:
+                pitch_zero = raw_pitch
+                roll_zero = raw_roll
+                imu_zero_captured = True
+                print("IMU zero set: pitch0={:.2f} roll0={:.2f}".format(pitch_zero, roll_zero))
+            pitch = raw_pitch - pitch_zero
+            roll = raw_roll - roll_zero
+            ax, ay, az = imu_data["ax"], imu_data["ay"], imu_data["az"]
+            imu_available = True
             last_gx, last_gy, last_gz = gx, gy, gz
+            last_pitch, last_roll = pitch, roll
+            last_ax, last_ay, last_az = ax, ay, az
             last_gyro_ms = utime.ticks_ms()
             imu_read_fail_count = 0
         except OSError as exc:
@@ -242,35 +298,51 @@ while True:
                 next_imu_retry_ms = utime.ticks_add(utime.ticks_ms(), IMU_RETRY_MS)
             if utime.ticks_diff(utime.ticks_ms(), last_gyro_ms) <= GYRO_HOLD_MS:
                 gx, gy, gz = last_gx, last_gy, last_gz
-                gyro_available = True
+                pitch, roll = last_pitch, last_roll
+                ax, ay, az = last_ax, last_ay, last_az
+                imu_available = True
             else:
                 gx = gy = gz = None
+                pitch = roll = None
+                ax = ay = az = None
 
-    if gyro_available:
-        gx_i = int(gx * 100)
-        gy_i = int(gy * 100)
-        gz_i = int(gz * 100)
+    if imu_available:
+        gx_i = _to_i16_cent(gx)
+        gy_i = _to_i16_cent(gy)
+        gz_i = _to_i16_cent(gz)
+        pitch_i = _to_i16_cent(pitch)
+        roll_i = _to_i16_cent(roll)
+        ax_i = _to_i16_cent(ax)
+        ay_i = _to_i16_cent(ay)
+        az_i = _to_i16_cent(az)
     else:
         gx_i = gy_i = gz_i = GYRO_MISSING_SENTINEL
+        pitch_i = roll_i = GYRO_MISSING_SENTINEL
+        ax_i = ay_i = az_i = GYRO_MISSING_SENTINEL
     dist_i = 0xFFFF if distance_cm is None else max(0, min(65534, int(distance_cm)))
 
-    # Packet format: b'T' + <uint16 distance_cm> + <int16 gx,gy,gz centi-deg/s>
-    payload = b"T" + ustruct.pack("<Hhhh", dist_i, gx_i, gy_i, gz_i)
+    # Packet format: b'T' + <Hhhhhhhhh>
+    # distance_cm + gx,gy,gz + pitch,roll + ax,ay,az (all int16 centi-units)
+    payload = b"T" + ustruct.pack(
+        "<Hhhhhhhhh", dist_i, gx_i, gy_i, gz_i, pitch_i, roll_i, ax_i, ay_i, az_i
+    )
 
     if nrf is None:
         if gx is None:
             print(
-                "Telemetry (offline): d={} gx=None gy=None gz=None".format(
+                "Telemetry (offline): d={} gx=None gy=None gz=None pitch=None roll=None".format(
                     "None" if distance_cm is None else "{:.1f}cm".format(distance_cm)
                 )
             )
         else:
             print(
-                "Telemetry (offline): d={} gx={:.2f} gy={:.2f} gz={:.2f}".format(
+                "Telemetry (offline): d={} gx={:.2f} gy={:.2f} gz={:.2f} pitch={:.2f} roll={:.2f}".format(
                     "None" if distance_cm is None else "{:.1f}cm".format(distance_cm),
                     gx,
                     gy,
                     gz,
+                    pitch,
+                    roll,
                 )
             )
     else:
@@ -280,17 +352,19 @@ while True:
             led.toggle()
             if gx is None:
                 print(
-                    "Sent Telemetry: d={} gx=None gy=None gz=None".format(
+                    "Sent Telemetry: d={} gx=None gy=None gz=None pitch=None roll=None".format(
                         "None" if distance_cm is None else "{:.1f}cm".format(distance_cm)
                     )
                 )
             else:
                 print(
-                    "Sent Telemetry: d={} gx={:.2f} gy={:.2f} gz={:.2f}".format(
+                    "Sent Telemetry: d={} gx={:.2f} gy={:.2f} gz={:.2f} pitch={:.2f} roll={:.2f}".format(
                         "None" if distance_cm is None else "{:.1f}cm".format(distance_cm),
                         gx,
                         gy,
                         gz,
+                        pitch,
+                        roll,
                     )
                 )
         except OSError as exc:
