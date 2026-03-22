@@ -34,10 +34,10 @@ _CMD_GYR_NORMAL = 0x15          # set gyro to normal power
 _CMD_SOFTRESET  = 0xB6
 
 _ACC_RANGE_2G   = 0x03          # ±2 g  → 16384 LSB/g
-_GYR_RANGE_250  = 0x00          # ±250 °/s → 131 LSB/°/s
+_GYR_RANGE_250  = 0x03          # ±250 °/s → 131.2 LSB/°/s
 
 _ACC_SCALE      = 9.80665 / 16384.0   # → m/s²
-_GYR_SCALE      = 1.0 / 131.0         # → °/s
+_GYR_SCALE      = 1.0 / 131.2         # → °/s
 
 # Complementary filter coefficient (0.98 = trust gyro 98 %, accel 2 %)
 _ALPHA          = 0.98
@@ -161,6 +161,11 @@ class IMU:
     # Keep a simple alias for callers that prefer read()
     def read(self) -> dict:
         return self.update()
+
+    def read_gyro(self) -> tuple[float, float, float]:
+        """Direct gyro read in deg/s (no rounding/filtering)."""
+        gx, gy, gz, _, _, _ = self._raw()
+        return gx, gy, gz
 
     # ── Helpers ───────────────────────────────────────────────
 

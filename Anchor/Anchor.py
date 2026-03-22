@@ -51,11 +51,13 @@ def _decode_packet(packet):
     """
     Decode tagged telemetry payload sent by Scout.
     Returns tuple (kind, value) where:
+    - ("telemetry", (distance_cm_or_none, gx, gy, gz))
     - ("gyro", (gx, gy, gz))
     - ("distance", distance_cm)
     - (None, None) if unknown
 
     Supported packet formats:
+    - b"T" + uint16 distance_cm + 3x int16 little-endian gyro (centi-deg/s)
     - b"G" + 3x int16 little-endian (gyro in centi-deg/s)
     - ASCII float (e.g. b"123.4")
     - 2-byte unsigned int, little-endian, distance in cm
@@ -65,6 +67,13 @@ def _decode_packet(packet):
     data = packet.rstrip(b"\x00")
     if not data:
         return (None, None)
+
+    if data[0] == 84 and len(data) >= 9:  # ord('T')
+        dist_i, gx_i, gy_i, gz_i = ustruct.unpack("<Hhhh", data[1:9])
+        distance_cm = None if dist_i == 0xFFFF else float(dist_i)
+        if gx_i == -32768 and gy_i == -32768 and gz_i == -32768:
+            return ("telemetry", (distance_cm, None, None, None))
+        return ("telemetry", (distance_cm, gx_i / 100.0, gy_i / 100.0, gz_i / 100.0))
 
     if data[0] == 71 and len(data) >= 7:  # ord('G')
         gx_i, gy_i, gz_i = ustruct.unpack("<hhh", data[1:7])
@@ -98,7 +107,18 @@ while True:
             buf = nrf.recv()
             kind, value = _decode_packet(buf)
 
-            if kind == "gyro":
+            if kind == "telemetry":
+                distance_cm, gx, gy, gz = value
+                d_label = "None" if distance_cm is None else "{:.1f} cm".format(distance_cm)
+                if gx is None:
+                    print("Received Telemetry: d={} gx=None gy=None gz=None".format(d_label))
+                else:
+                    print(
+                        "Received Telemetry: d={} gx={:.2f} gy={:.2f} gz={:.2f} deg/s".format(
+                            d_label, gx, gy, gz
+                        )
+                    )
+            elif kind == "gyro":
                 gx, gy, gz = value
                 print("Received Gyro: gx={:.2f} gy={:.2f} gz={:.2f} deg/s".format(gx, gy, gz))
             elif kind == "distance":
