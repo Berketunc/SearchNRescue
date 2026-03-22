@@ -63,11 +63,19 @@ class ArtificialHorizon(QWidget):
         super().__init__()
         self.pitch = 0.0   # degrees, positive = nose up
         self.roll  = 0.0   # degrees, positive = right wing down
+        self.has_data = False
         self.setMinimumSize(160, 160)
 
     def set_attitude(self, pitch, roll):
         self.pitch = pitch
         self.roll  = roll
+        self.has_data = True
+        self.update()
+
+    def clear_data(self):
+        self.pitch = 0.0
+        self.roll = 0.0
+        self.has_data = False
         self.update()
 
     def paintEvent(self, _):
@@ -152,6 +160,15 @@ class ArtificialHorizon(QWidget):
         p.setBrush(QBrush(Qt.GlobalColor.white))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(QPointF(cx, cy), 3, 3)
+
+        if not self.has_data:
+            p.setPen(QPen(qc(TEXT_DIM)))
+            p.setFont(QFont(SANS, 8, QFont.Weight.Medium))
+            p.drawText(
+                QRectF(cx - r, cy - 8, 2 * r, 16),
+                Qt.AlignmentFlag.AlignCenter,
+                "Waiting for data",
+            )
 
 
 class CompassHSI(QWidget):
@@ -1207,6 +1224,7 @@ class DashboardWindow(QMainWindow):
         self._serial_thread.telemetry.connect(self._on_telemetry)
         self._serial_thread.start()
         self._connected_port = port
+        self.horizon.clear_data()
         self.accel.clear_data()
 
         self.status_badge.setText(f"● Connected — {port} @ 115200 baud")
@@ -1240,6 +1258,7 @@ class DashboardWindow(QMainWindow):
         )
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
+        self.horizon.clear_data()
         self.accel.clear_data()
         self._log("[SERIAL] Disconnected.", color=WARN)
 
@@ -1442,11 +1461,17 @@ class DashboardWindow(QMainWindow):
     def _on_telemetry(self, data):
         self._latest_telemetry.update(data)
 
-        if "PITCH" in data:
-            self.horizon.set_attitude(
-                data.get("PITCH", 0), data.get("ROLL", 0)
-            )
-            self._update_attitude_labels(data.get("PITCH", 0), data.get("ROLL", 0))
+        pitch = data.get("PITCH")
+        if pitch is None and "PICH" in data:
+            # Accept typo alias from upstream sender if present.
+            pitch = data.get("PICH")
+        roll = data.get("ROLL")
+
+        if pitch is not None and roll is not None:
+            self._latest_telemetry["PITCH"] = pitch
+            self._latest_telemetry["ROLL"] = roll
+            self.horizon.set_attitude(pitch, roll)
+            self._update_attitude_labels(pitch, roll)
 
         if "HEADING" in data:
             h = data["HEADING"]
@@ -1468,27 +1493,16 @@ class DashboardWindow(QMainWindow):
             if self.sig_val_lbl:
                 self.sig_val_lbl.setText(f"{v:.0f} dBm")
 
-        # Keep Scout unchanged and map gx/gy/gz into existing ax/ay/az display.
-        ax = data.get("AX")
-        ay = data.get("AY")
-        az = data.get("AZ")
-
-        if ax is None and "GX" in data:
-            ax = data.get("GX")
-        if ay is None and "GY" in data:
-            ay = data.get("GY")
-        if az is None:
-            if "GZ" in data and data.get("GZ") is not None:
-                az = data.get("GZ")
-            elif "GY" in data:
-                # Requested mapping fallback: use gy when gz is not available.
-                az = data.get("GY")
-
-        if ax is not None and ay is not None and az is not None:
-            self._latest_telemetry["AX"] = ax
-            self._latest_telemetry["AY"] = ay
-            self._latest_telemetry["AZ"] = az
-            self.accel.set_accel(ax, ay, az)
+        # Accelerometer graph is driven strictly by AX/AY/AZ values.
+        if "AX" in data or "AY" in data or "AZ" in data:
+            ax = data.get("AX")
+            ay = data.get("AY")
+            az = data.get("AZ")
+            if ax is not None and ay is not None and az is not None:
+                self._latest_telemetry["AX"] = ax
+                self._latest_telemetry["AY"] = ay
+                self._latest_telemetry["AZ"] = az
+                self.accel.set_accel(ax, ay, az)
 
         if self._csv_writer:
             self._write_csv_row()
@@ -1502,6 +1516,9 @@ class DashboardWindow(QMainWindow):
     # ── Demo Animation (when no serial connected) ─────────────────────────────
 
     def _demo_tick(self):
+        if self._connected_port or self._anchor_running:
+            return   # real data takes over while connected/anchor active
+
         if self._serial_thread and self._serial_thread.isRunning():
             return   # real data takes over
 
@@ -1517,8 +1534,7 @@ class DashboardWindow(QMainWindow):
         ay      = 0.3 * math.cos(t * 0.9)
         az      = 9.81 + 0.2 * math.sin(t * 2)
 
-        self.horizon.set_attitude(pitch, roll)
-        self._update_attitude_labels(pitch, roll)
+        # Keep horizon in data-driven mode (no synthetic values).
         self.compass.set_heading(heading)
         if self.hdg_lbl:
             self.hdg_lbl.setText(f"{int(heading):03d}°")
