@@ -1,0 +1,70 @@
+flowchart TB
+   subgraph ScoutPico[Scout Pico]
+      SGP18[GP18 SCK]
+      SGP19[GP19 MOSI]
+      SGP16[GP16 MISO]
+      SGP14[GP14 CSN]
+      SGP17[GP17 CE]
+      SGP6[GP6 TRIG]
+      SGP7[GP7 ECHO]
+      SGP4[GP4 I2C SDA]
+      SGP5[GP5 I2C SCL]
+   end
+
+   subgraph AnchorPico[Anchor Pico]
+      AGP18[GP18 SCK]
+      AGP19[GP19 MOSI]
+      AGP16[GP16 MISO]
+      AGP14[GP14 CSN]
+      AGP17[GP17 CE]
+      AUSB[USB serial to PC]
+   end
+
+   subgraph NRFScout[nRF24L01 Scout]
+      NSCK[SCK]
+      NMOSI[MOSI]
+      NMISO[MISO]
+      NCSN[CSN]
+      NCE[CE]
+      NVCC[3.3V]
+      NGND[GND]
+   end
+
+   subgraph NRFAnchor[nRF24L01 Anchor]
+      ASCK[SCK]
+      AMOSI[MOSI]
+      AMISO[MISO]
+      ACSN[CSN]
+      ACE[CE]
+      AVCC[3.3V]
+      AGND[GND]
+   end
+
+   subgraph HCSR04[HC-SR04]
+      HTRIG[TRIG]
+      HECHO[ECHO]
+   end
+
+   subgraph BMI160[BMI160]
+      BI2CSDA[SDA]
+      BI2CSCL[SCL]
+   end
+
+   SGP18 --> NSCK
+   SGP19 --> NMOSI
+   SGP16 --> NMISO
+   SGP14 --> NCSN
+   SGP17 --> NCE
+
+   AGP18 --> ASCK
+   AGP19 --> AMOSI
+   AGP16 --> AMISO
+   AGP14 --> ACSN
+   AGP17 --> ACE
+
+   SGP6 --> HTRIG
+   SGP7 --> HECHO
+   SGP4 --> BI2CSDA
+   SGP5 --> BI2CSCL
+
+   AUSB --> PC[Dashboard PC]

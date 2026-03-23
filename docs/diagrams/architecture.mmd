@@ -1,0 +1,31 @@
+flowchart LR
+   subgraph FirmwareScout[Scout Firmware]
+      SMain[Scout/scout.py]
+      SImu[control/imu.py]
+      SRadio[nrf24l01.py]
+      SUltra[HC-SR04 read_distance_cm]
+      SMain --> SImu
+      SMain --> SRadio
+      SMain --> SUltra
+   end
+
+   subgraph FirmwareAnchor[Anchor Firmware]
+      AMain[Anchor/Anchor.py]
+      ARadio[nrf24l01.py]
+      ADecode[_decode_packet]
+      AMain --> ARadio
+      AMain --> ADecode
+   end
+
+   subgraph Desktop[Desktop App]
+      DMain[dashboard/dashboard.py]
+      DSerial[SerialReaderThread]
+      DRadar[RadarNodeMap]
+      DAtt[ArtificialHorizon + AccelReadout]
+      DMain --> DSerial
+      DSerial --> DRadar
+      DSerial --> DAtt
+   end
+
+   SMain -- NRF24 telemetry packet --> AMain
+   AMain -- USB serial text --> DSerial
